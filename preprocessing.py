@@ -644,100 +644,97 @@ class MocapParameterizer(BaseEstimator, TransformerMixin):
         return Q
 
 #################### Motorica Mirror ###################################
-# class Mirror(BaseEstimator, TransformerMixin):
-#     def __init__(self, axis="X", append=True):
-#         """
-#         Mirrors the data 
-#         """
-#         self.axis = axis
-#         self.append = append
+class Mirror(BaseEstimator, TransformerMixin):
+    def __init__(self, axis="X", append=True):
+        """
+        Mirrors the data 
+        """
+        self.axis = axis
+        self.append = append
         
     
-#     def fit(self, X, y=None):
-#         return self
+    def fit(self, X, y=None):
+        return self
     
-#     def transform(self, X, y=None):
-#         print("Mirror: " + self.axis)
-#         Q = []
+    def transform(self, X, y=None):
+        print("Mirror: " + self.axis)
+        Q = []
         
-#         if self.append:
-#             for track in X:
-#                 Q.append(track)
+        if self.append:
+            for track in X:
+                Q.append(track)
             
-#         for track in X:
-#             channels = []
-#             titles = []
+        for track in X:
+            channels = []
+            titles = []
             
-#             if self.axis == "X":
-#                 signs = np.array([1,-1,-1])
-#             if self.axis == "Y":
-#                 signs = np.array([-1,1,-1])
-#             if self.axis == "Z":
-#                 signs = np.array([-1,-1,1])
+            if self.axis == "X":
+                signs = np.array([1,-1,-1])
+            if self.axis == "Y":
+                signs = np.array([-1,1,-1])
+            if self.axis == "Z":
+                signs = np.array([-1,-1,1])
 
-#             euler_df = track.values
+            euler_df = track.values
 
-#             # Create a new DataFrame to store the exponential map rep
-#             new_df = pd.DataFrame(index=euler_df.index)
+            # Create a new DataFrame to store the exponential map rep
+            new_df = pd.DataFrame(index=euler_df.index)
 
-#             # Copy the root positions into the new DataFrame
-#             rxp = '%s_Xposition'%track.root_name
-#             ryp = '%s_Yposition'%track.root_name
-#             rzp = '%s_Zposition'%track.root_name
-#             new_df[rxp] = pd.Series(data=-signs[0]*euler_df[rxp], index=new_df.index)
-#             new_df[ryp] = pd.Series(data=-signs[1]*euler_df[ryp], index=new_df.index)
-#             new_df[rzp] = pd.Series(data=-signs[2]*euler_df[rzp], index=new_df.index)
+            # Copy the root positions into the new DataFrame
+            rxp = '%s_Xposition'%track.root_name
+            ryp = '%s_Yposition'%track.root_name
+            rzp = '%s_Zposition'%track.root_name
+            new_df[rxp] = pd.Series(data=-signs[0]*euler_df[rxp], index=new_df.index)
+            new_df[ryp] = pd.Series(data=-signs[1]*euler_df[ryp], index=new_df.index)
+            new_df[rzp] = pd.Series(data=-signs[2]*euler_df[rzp], index=new_df.index)
             
-#             # List the columns that contain rotation channels
-#             rots = [c for c in euler_df.columns if ('rotation' in c and 'Nub' not in c)]
-#             #lft_rots = [c for c in euler_df.columns if ('Left' in c and 'rotation' in c and 'Nub' not in c)]
-#             #rgt_rots = [c for c in euler_df.columns if ('Right' in c and 'rotation' in c and 'Nub' not in c)]
-#             lft_joints = (joint for joint in track.skeleton if 'Left' in joint and 'Nub' not in joint)
-#             rgt_joints = (joint for joint in track.skeleton if 'Right' in joint and 'Nub' not in joint)
+            # List the columns that contain rotation channels
+            rots = [c for c in euler_df.columns if ('rotation' in c and 'Nub' not in c)]
+            #lft_rots = [c for c in euler_df.columns if ('Left' in c and 'rotation' in c and 'Nub' not in c)]
+            #rgt_rots = [c for c in euler_df.columns if ('Right' in c and 'rotation' in c and 'Nub' not in c)]
+            lft_joints = (joint for joint in track.skeleton if 'Left' in joint and 'Nub' not in joint)
+            rgt_joints = (joint for joint in track.skeleton if 'Right' in joint and 'Nub' not in joint)
                         
-#             new_track = track.clone()
+            new_track = track.clone()
 
-#             for lft_joint in lft_joints:
-#                 #lr = euler_df[[c for c in rots if lft_joint + "_" in c]]                                
-#                 #rot_order = track.skeleton[lft_joint]['order']                
-#                 #lft_eulers = [[f[1]['%s_Xrotation'%lft_joint], f[1]['%s_Yrotation'%lft_joint], f[1]['%s_Zrotation'%lft_joint]] for f in lr.iterrows()]
-                
-#                 rgt_joint = lft_joint.replace('Left', 'Right')
-#                 #rr = euler_df[[c for c in rots if rgt_joint + "_" in c]]
-#                 #rot_order = track.skeleton[rgt_joint]['order']                
-# #                rgt_eulers = [[f[1]['%s_Xrotation'%rgt_joint], f[1]['%s_Yrotation'%rgt_joint], f[1]['%s_Zrotation'%rgt_joint]] for f in rr.iterrows()]
-                
-#                 # Create the corresponding columns in the new DataFrame
-                
-#                 new_df['%s_Xrotation'%lft_joint] = pd.Series(data=signs[0]*track.values['%s_Xrotation'%rgt_joint], index=new_df.index)
-#                 new_df['%s_Yrotation'%lft_joint] = pd.Series(data=signs[1]*track.values['%s_Yrotation'%rgt_joint], index=new_df.index)
-#                 new_df['%s_Zrotation'%lft_joint] = pd.Series(data=signs[2]*track.values['%s_Zrotation'%rgt_joint], index=new_df.index)
-                
-#                 new_df['%s_Xrotation'%rgt_joint] = pd.Series(data=signs[0]*track.values['%s_Xrotation'%lft_joint], index=new_df.index)
-#                 new_df['%s_Yrotation'%rgt_joint] = pd.Series(data=signs[1]*track.values['%s_Yrotation'%lft_joint], index=new_df.index)
-#                 new_df['%s_Zrotation'%rgt_joint] = pd.Series(data=signs[2]*track.values['%s_Zrotation'%lft_joint], index=new_df.index)
+            # Efficiently mirror left ↔ right joint rotations with sign adjustments
+            columns_to_add = {}
+            for lft_joint in lft_joints:
+                rgt_joint = lft_joint.replace('Left', 'Right')
+
+                # Mirror right → left
+                columns_to_add[f'{lft_joint}_Xrotation'] = signs[0] * track.values[f'{rgt_joint}_Xrotation']
+                columns_to_add[f'{lft_joint}_Yrotation'] = signs[1] * track.values[f'{rgt_joint}_Yrotation']
+                columns_to_add[f'{lft_joint}_Zrotation'] = signs[2] * track.values[f'{rgt_joint}_Zrotation']
+
+                # Mirror left → right
+                columns_to_add[f'{rgt_joint}_Xrotation'] = signs[0] * track.values[f'{lft_joint}_Xrotation']
+                columns_to_add[f'{rgt_joint}_Yrotation'] = signs[1] * track.values[f'{lft_joint}_Yrotation']
+                columns_to_add[f'{rgt_joint}_Zrotation'] = signs[2] * track.values[f'{lft_joint}_Zrotation']
+
+            # Add all mirrored columns at once to avoid fragmentation
+            new_df = pd.concat([new_df, pd.DataFrame(columns_to_add, index=new_df.index)], axis=1)
     
-#             # List the joints that are not left or right, i.e. are on the trunk
-#             joints = (joint for joint in track.skeleton if 'Nub' not in joint and 'Left' not in joint and 'Right' not in joint)
+            # List the joints that are not left or right, i.e. are on the trunk
+            joints = (joint for joint in track.skeleton if 'Nub' not in joint and 'Left' not in joint and 'Right' not in joint)
 
-#             for joint in joints:
-#                 #r = euler_df[[c for c in rots if joint in c]] # Get the columns that belong to this joint
-#                 #rot_order = track.skeleton[joint]['order']
+            # Create the corresponding columns for all joints at once to avoid fragmentation
+            columns_to_add = {}
+            for joint in joints:
+                columns_to_add[f'{joint}_Xrotation'] = signs[0] * track.values[f'{joint}_Xrotation']
+                columns_to_add[f'{joint}_Yrotation'] = signs[1] * track.values[f'{joint}_Yrotation']
+                columns_to_add[f'{joint}_Zrotation'] = signs[2] * track.values[f'{joint}_Zrotation']
 
-#                 #eulers = [[f[1]['%s_Xrotation'%joint], f[1]['%s_Yrotation'%joint], f[1]['%s_Zrotation'%joint]] for f in r.iterrows()]
+            # Concatenate all new columns at once
+            new_df = pd.concat([new_df, pd.DataFrame(columns_to_add, index=new_df.index)], axis=1)
 
-#                 # Create the corresponding columns in the new DataFrame
-#                 new_df['%s_Xrotation'%joint] = pd.Series(data=signs[0]*track.values['%s_Xrotation'%joint], index=new_df.index)
-#                 new_df['%s_Yrotation'%joint] = pd.Series(data=signs[1]*track.values['%s_Yrotation'%joint], index=new_df.index)
-#                 new_df['%s_Zrotation'%joint] = pd.Series(data=signs[2]*track.values['%s_Zrotation'%joint], index=new_df.index)
+            new_track.values = new_df
+            Q.append(new_track)
 
-#             new_track.values = new_df
-#             Q.append(new_track)
+        return Q
 
-#         return Q
-
-#     def inverse_transform(self, X, copy=None, start_pos=None):
-#         return X
+    def inverse_transform(self, X, copy=None, start_pos=None):
+        return X
 
 
 #################### Finedance Mirror ###################################
@@ -2580,4 +2577,45 @@ class TemplateTransform(BaseEstimator, TransformerMixin):
 
     def transform(self, X, y=None):
         return X
+
+class ColumnDropper(BaseEstimator, TransformerMixin):
+    def __init__(self, columns_to_drop=None):
+        self.columns_to_drop = columns_to_drop or []
+
+    def fit(self, X, y=None):
+        return self
+
+    def transform(self, X):
+        if hasattr(X, '__iter__') and not isinstance(X, (dict, str)):
+            return [self._drop_columns(df) for df in X]
+        else:
+            return self._drop_columns(X)
+
+    def inverse_transform(self, X):
+        # Re-add missing columns as 0s
+        if hasattr(X, '__iter__') and not isinstance(X, (dict, str)):
+            return [self._restore_columns(df) for df in X]
+        else:
+            return self._restore_columns(X)
+
+    def _drop_columns(self, df):
+        if hasattr(df, 'values'):
+            for col in self.columns_to_drop:
+                if col in df.values.columns:
+                    df.values.drop(columns=col, inplace=True)
+        else:
+            df.drop(columns=[col for col in self.columns_to_drop if col in df.columns], inplace=True)
+        return df
+
+    def _restore_columns(self, df):
+        if hasattr(df, 'values'):
+            for col in self.columns_to_drop:
+                if col not in df.values.columns:
+                    df.values[col] = 0.0
+        else:
+            for col in self.columns_to_drop:
+                if col not in df.columns:
+                    df[col] = 0.0
+        return df
+
 
