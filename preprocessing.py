@@ -738,7 +738,7 @@ class Mirror(BaseEstimator, TransformerMixin):
 
 
 #################### Finedance Mirror ###################################
-class MirrorYbot(BaseEstimator, TransformerMixin):
+class MirrorFinedance(BaseEstimator, TransformerMixin):
     def __init__(self, axis="X", append=True):
         self.axis = axis
         self.append = append
@@ -1080,158 +1080,6 @@ class JointSelector(BaseEstimator, TransformerMixin):
             Q.append(t2)
 
         return Q
-
-
-# class Numpyfier(BaseEstimator, TransformerMixin):
-#     """
-#     Converts the values in a MocapData object into a NumPy array.
-#     Useful for the final stage of a pipeline before training.
-
-#     Also provides an inverse_transform method to convert the NumPy array 
-#     back to a MocapData object with its original structure.
-#     """
-
-#     def __init__(self, indices=None):
-#         """
-#         Initializes the Numpyfier with optional indices to filter specific columns.
-
-#         Parameters:
-#         ----------
-#         indices : list, optional
-#             List of column names to retain during transformation. 
-#             If None, all columns are used.
-#         """
-#         self.indices = indices
-
-#     def fit(self, X, y=None):
-#         """
-#         Fit method for the transformer. Stores a copy of the first MocapData object 
-#         with values cleared for use in inverse transformation.
-
-#         Parameters:
-#         ----------
-#         X : list of MocapData
-#             The input data to fit on.
-        
-#         Returns:
-#         -------
-#         self : Numpyfier
-#             The fitted transformer.
-#         """
-#         if len(X) == 0:
-#             raise ValueError("Input data X must contain at least one MocapData object.")
-        
-#         # Clone and clear the first MocapData object
-#         self.org_mocap_ = X[0].clone()
-#         self.org_mocap_.values.drop(self.org_mocap_.values.index, inplace=True)
-        
-#         # Store the column indices
-#         if self.indices is not None:
-#             self.indices_ = [col for col in self.indices if col in self.org_mocap_.values.columns]
-#         else:
-#             self.indices_ = self.org_mocap_.values.columns
-        
-#         return self
-
-#     def transform(self, X, y=None):
-#         """
-#         Transforms the input MocapData objects into a NumPy array, retaining only the specified columns.
-
-#         Parameters:
-#         ----------
-#         X : list of MocapData
-#             The input data to transform.
-        
-#         Returns:
-#         -------
-#         numpy.ndarray
-#             The transformed data as a NumPy array.
-#         """
-#         Q = []
-        
-#         for track in X:
-#             # Filter the columns based on self.indices_
-#             filtered_values = track.values[self.indices_]
-#             Q.append(filtered_values.values)
-#             # print("Numpyfier:", filtered_values.columns)  # Debugging: check the order of the data
-            
-#         return np.array(Q)
-
-#     def inverse_transform(self, X, copy=None):
-#         """
-#         Inverse transforms the NumPy array back into MocapData objects.
-
-#         Parameters:
-#         ----------
-#         X : numpy.ndarray
-#             The input data to inverse transform.
-#         copy : None or bool, optional
-#             If True, makes a copy of the input array. Not used here.
-        
-#         Returns:
-#         -------
-#         list of MocapData
-#             The inverse transformed data as a list of MocapData objects.
-#         """
-#         Q = []
-
-#         for track in X:
-#             new_mocap = self.org_mocap_.clone()
-#             time_index = pd.to_timedelta(range(track.shape[0]), unit='s') * new_mocap.framerate
-            
-#             # Reconstruct the DataFrame with original columns
-#             new_df = pd.DataFrame(data=track, index=time_index, columns=self.indices_)
-            
-#             new_mocap.values = new_df
-#             Q.append(new_mocap)
-
-#         return Q
-    
-
-# class Numpyfier(BaseEstimator, TransformerMixin):
-#     '''
-#     Just converts the values in a MocapData object into a numpy array
-#     Useful for the final stage of a pipeline before training
-#     '''
-#     def __init__(self):
-#         pass
-
-#     def fit(self, X, y=None):
-#         self.org_mocap_ = X[0].clone()
-#         self.org_mocap_.values.drop(self.org_mocap_.values.index, inplace=True)
-
-#         return self
-
-#     def transform(self, X, y=None):
-#         print("Numpyfier")
-#         Q = [track.values.to_numpy() for track in X]  # Convert DataFrame to NumPy array
-
-#         # Find the maximum shape across all tracks
-#         max_rows = max(track.shape[0] for track in Q)
-#         max_cols = max(track.shape[1] for track in Q)
-
-#         # Pad each track to have the same shape
-#         padded_Q = [np.pad(track, ((0, max_rows - track.shape[0]), (0, max_cols - track.shape[1])), 
-#                             mode='constant', constant_values=0) for track in Q]
-
-#         return np.stack(padded_Q)  # Now all arrays have the same shape
-
-#     def inverse_transform(self, X, copy=None):
-#         Q = []
-
-#         for track in X:
-            
-#             new_mocap = self.org_mocap_.clone()
-#             time_index = pd.to_timedelta([f for f in range(track.shape[0])], unit='s')
-
-#             new_df =  pd.DataFrame(data=track, index=time_index, columns=self.org_mocap_.values.columns)
-            
-#             new_mocap.values = new_df
-            
-
-#             Q.append(new_mocap)
-
-#         return Q
 
 
 class Numpyfier(BaseEstimator, TransformerMixin):
@@ -2532,34 +2380,22 @@ class FeatureCounter(BaseEstimator, TransformerMixin):
         self.n_features = None  # Store number of features dynamically
 
     def fit(self, X, y=None):
-        """
-        Count the number of features AFTER other transformations.
-        """
-        if isinstance(X, list) and len(X) > 0:
-            self.n_features = len(X[0].values.columns)  # Count features dynamically
+        if isinstance(X, np.ndarray):
+            self.n_features = X.shape[-1]
+            print(f"\n📊 Final Feature Count: {self.n_features}")
+        elif isinstance(X, list) and len(X) > 0 and hasattr(X[0], 'values'):
+            self.n_features = len(X[0].values.columns)
+            print(f"\n📊 Final Feature Count: {self.n_features}")
         else:
-            raise ValueError("FeatureCounter received an empty dataset!")
-
-        print(f"\n📊 **Final Feature Count (After ConstantsRemover): {self.n_features}**")
-        print(f"Features: {X[0].values.columns.tolist()}")
+            raise ValueError("Unsupported data format for FeatureCounter.")
         return self
 
     def transform(self, X, y=None):
         return X
 
     def inverse_transform(self, X, copy=None):
-        """
-        Ensure the transformed data has the correct feature dimensions before inversion.
-        """
-        if self.n_features is None:
-            raise ValueError("FeatureCounter was not fitted properly. n_features is None.")
-
-        for track in X:
-            if len(track.values.columns) != self.n_features:
-                raise ValueError(
-                    f"Feature mismatch! Expected {self.n_features}, but got {len(track.values.columns)}."
-                )
-
+        self.n_features = X.shape[-1]
+        print(f"🔄 Updated Feature Count: {self.n_features}")
         return X
 
 #TODO: JointsSelector (x)
