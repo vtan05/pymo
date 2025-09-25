@@ -737,153 +737,92 @@ class Mirror(BaseEstimator, TransformerMixin):
         return X
 
 
-#################### Finedance Mirror ###################################
-class MirrorFinedance(BaseEstimator, TransformerMixin):
+class Mirror_New(BaseEstimator, TransformerMixin):
     def __init__(self, axis="X", append=True):
-        self.axis = axis
+        self.axis = axis.upper()
         self.append = append
 
     def fit(self, X, y=None):
         return self
 
     def transform(self, X, y=None):
-        Q = []
-
+        print("Mirror:", self.axis)
+        out = []
         if self.append:
-            Q.extend(X)
+            out.extend(X)
+
+        # define sign patterns
+        if self.axis == "X":
+            pos_signs = np.array([-1,  1,  1])  # flip X only
+            rot_signs = np.array([ 1, -1, -1])  # flip Y,Z rotations
+        elif self.axis == "Y":
+            pos_signs = np.array([ 1, -1,  1])
+            rot_signs = np.array([-1,  1, -1])
+        elif self.axis == "Z":
+            pos_signs = np.array([ 1,  1, -1])
+            rot_signs = np.array([-1, -1,  1])
+        else:
+            raise ValueError(f"Unknown axis {self.axis}")
 
         for track in X:
-            new_df = track.values.copy()  # Copy motion data
+            df = track.values.copy()  # keep all columns
 
-            # ✅ Define mirroring signs based on the axis
-            axis_signs = {
-                "X": np.array([1, -1, -1]),  # Flip Y and Z
-                "Y": np.array([-1, 1, -1]),  # Flip X and Z
-                "Z": np.array([-1, -1, 1])   # Flip X and Y
-            }
+            # flip root positions only
+            rxp = f"{track.root_name}_Xposition"
+            ryp = f"{track.root_name}_Yposition"
+            rzp = f"{track.root_name}_Zposition"
+            for col, s in zip([rxp, ryp, rzp], pos_signs):
+                if col in df.columns:
+                    df[col] = s * df[col]
 
-            if self.axis not in axis_signs:
-                raise ValueError("Axis must be 'X', 'Y', or 'Z'.")
+            # helper to apply rot_signs to a joint's XYZ rotation
+            def flip_joint_rot(jname):
+                cols = [f"{jname}_Xrotation", f"{jname}_Yrotation", f"{jname}_Zrotation"]
+                present = [c for c in cols if c in df.columns]
+                if len(present) == 3:
+                    df[cols[0]] = rot_signs[0] * df[cols[0]]
+                    df[cols[1]] = rot_signs[1] * df[cols[1]]
+                    df[cols[2]] = rot_signs[2] * df[cols[2]]
 
-            signs = axis_signs[self.axis]
+            # swap Left <-> Right joints (mirror sides) + flip signs
+            # gather once to avoid generator exhaustion
+            lft_joints = [j for j in track.skeleton if "Left" in j and "Nub" not in j]
+            for lj in lft_joints:
+                rj = lj.replace("Left", "Right")
+                # if either side missing, just flip whatever exists
+                L = [f"{lj}_Xrotation", f"{lj}_Yrotation", f"{lj}_Zrotation"]
+                R = [f"{rj}_Xrotation", f"{rj}_Yrotation", f"{rj}_Zrotation"]
+                if all(c in df.columns for c in L+R):
+                    # swap values then sign-flip
+                    tmp = df[L].copy()
+                    df[L] = df[R].values
+                    df[R] = tmp.values
+                    # apply rot sign flips to both
+                    df[L[0]] = rot_signs[0] * df[L[0]]
+                    df[L[1]] = rot_signs[1] * df[L[1]]
+                    df[L[2]] = rot_signs[2] * df[L[2]]
+                    df[R[0]] = rot_signs[0] * df[R[0]]
+                    df[R[1]] = rot_signs[1] * df[R[1]]
+                    df[R[2]] = rot_signs[2] * df[R[2]]
+                else:
+                    # fall back: just flip whatever exists
+                    flip_joint_rot(lj)
+                    flip_joint_rot(rj)
 
-            # ✅ Mirror root position carefully
-            root_pos_cols = [f"{track.root_name}_Xposition",
-                             f"{track.root_name}_Yposition",
-                             f"{track.root_name}_Zposition"]
+            # flip trunk joints (non-left/right, non-Nub) in place
+            trunk = [j for j in track.skeleton if "Nub" not in j and "Left" not in j and "Right" not in j]
+            for j in trunk:
+                flip_joint_rot(j)
 
-            for i, col in enumerate(root_pos_cols):
-                if col in new_df.columns:
-                    if i == 1:  
-                        if self.axis == "Y":  
-                            new_df[col] = -track.values[col]  # Flip Y if mirroring along Y-axis
-                        else:
-                            new_df[col] = track.values[col]  # Keep height unchanged for X/Z mirroring
-                    else:
-                        new_df[col] = signs[i] * track.values[col]
+            mirrored = track.clone()
+            mirrored.values = df  # keep full column set
+            out.append(mirrored)
 
-            # ✅ Mirror Legs Correctly
-            leg_joints = ["UpLeg", "Leg", "Foot", "ToeBase"]
-            rotation_axes = ["Xrotation", "Yrotation", "Zrotation"]
-
-            for suffix in leg_joints:
-                left_limb = f"Left{suffix}"
-                right_limb = f"Right{suffix}"
-
-                if left_limb in track.skeleton and right_limb in track.skeleton:
-                    for rot_axis in rotation_axes:
-                        left_col = f"{left_limb}_{rot_axis}"
-                        right_col = f"{right_limb}_{rot_axis}"
-
-                        if left_col in new_df.columns and right_col in new_df.columns:
-                            new_df[left_col], new_df[right_col] = (
-                                signs[0] * new_df[right_col],  
-                                signs[0] * new_df[left_col]
-                            )
-
-            # ✅ Mirror Chest and Spine
-            trunk_joints = ["Spine", "Chest"]
-            for trunk_joint in trunk_joints:
-                for rot_axis in rotation_axes:
-                    col = f"{trunk_joint}_{rot_axis}"
-                    if col in new_df.columns:
-                        new_df[col] = signs[0] * track.values[col]
-
-            # # ✅ Swap Shoulders Without Changing Their Rotation
-            # shoulder_joints = ["Shoulder"]
-            # for suffix in shoulder_joints:
-            #     left_shoulder = f"Left{suffix}"
-            #     right_shoulder = f"Right{suffix}"
-
-            #     if left_shoulder in track.skeleton and right_shoulder in track.skeleton:
-            #         for rot_axis in rotation_axes:
-            #             left_col = f"{left_shoulder}_{rot_axis}"
-            #             right_col = f"{right_shoulder}_{rot_axis}"
-
-            #             if left_col in new_df.columns and right_col in new_df.columns:
-            #                 # 🚀 **Swap shoulders but do NOT flip their rotations**
-            #                 new_df[left_col], new_df[right_col] = new_df[right_col], new_df[left_col]
-
-            # # ✅ Swap Arms Left-Right Without Changing Rotation
-            # arm_joints = ["Arm", "Hand"]
-
-            # for suffix in arm_joints:
-            #     left_arm = f"Left{suffix}"
-            #     right_arm = f"Right{suffix}"
-
-            #     if left_arm in track.skeleton and right_arm in track.skeleton:
-            #         for rot_axis in rotation_axes:
-            #             left_col = f"{left_arm}_{rot_axis}"
-            #             right_col = f"{right_arm}_{rot_axis}"
-
-            #             if left_col in new_df.columns and right_col in new_df.columns:
-            #                 # 🚀 **Only swap arms, DO NOT apply sign flipping**
-            #                 new_df[left_col], new_df[right_col] = (
-            #                     new_df[right_col],  # Keep original values
-            #                     new_df[left_col]
-            #                 )
-
-            # # ✅ Fix Forearm Rotation to Prevent Opposite Bending
-            # forearm_joints = ["ForeArm"]
-
-            # for suffix in forearm_joints:
-            #     left_forearm = f"Left{suffix}"
-            #     right_forearm = f"Right{suffix}"
-
-            #     if left_forearm in track.skeleton and right_forearm in track.skeleton:
-            #         for rot_axis in rotation_axes:
-            #             left_col = f"{left_forearm}_{rot_axis}"
-            #             right_col = f"{right_forearm}_{rot_axis}"
-
-            #             if left_col in new_df.columns and right_col in new_df.columns:
-            #                 if rot_axis == "Xrotation":
-            #                     # 🚀 **Flip X rotation to fix elbow bending**
-            #                     new_df[left_col], new_df[right_col] = (
-            #                         -new_df[right_col],  
-            #                         -new_df[left_col]
-            #                     )
-            #                 elif rot_axis == "Yrotation":
-            #                     # 🚀 **Flip Y rotation to fix wrist twist**
-            #                     new_df[left_col], new_df[right_col] = (
-            #                         -new_df[right_col],  
-            #                         -new_df[left_col]
-            #                     )
-            #                 elif rot_axis == "Zrotation":
-            #                     # 🚀 **Keep Z rotation as is to maintain natural movement**
-            #                     new_df[left_col], new_df[right_col] = (
-            #                         new_df[right_col],  
-            #                         new_df[left_col]
-            #                     )
-
-            # ✅ Clone track and update values
-            new_track = track.clone()
-            new_track.values = new_df
-            Q.append(new_track)
-
-        return Q
+        return out
 
     def inverse_transform(self, X, copy=None, start_pos=None):
         return X
+
 
 
 class RootAugmentation(BaseEstimator, TransformerMixin):
@@ -1083,127 +1022,230 @@ class JointSelector(BaseEstimator, TransformerMixin):
 
 
 class Numpyfier(BaseEstimator, TransformerMixin):
-    """
-    Converts MocapData objects into NumPy arrays for model training.
-    Ensures selected features match post-ConstantsRemover output.
-    """
-
-    def __init__(self, indices=None):
-        """
-        :param indices: List of column names OR indices to keep. If None, keeps all columns AFTER preprocessing.
-        """
-        self.indices = indices
-        self.selected_indices_ = None
-        self.selected_columns_ = None
-        self.org_mocap_ = None
+    '''
+    Just converts the values in a MocapData object into a numpy array
+    Useful for the final stage of a pipeline before training
+    '''
+    def __init__(self):
+        pass
 
     def fit(self, X, y=None):
-        """
-        Determines which columns to keep based on `ConstantsRemover` output.
-        """
-        if not X:
-            raise ValueError("Numpyfier received an empty dataset!")
-
-        # Clone the first MocapData instance as a reference
         self.org_mocap_ = X[0].clone()
-        self.org_mocap_.values = self.org_mocap_.values.iloc[:0]  # Keep structure but remove rows
-
-        all_columns = self.org_mocap_.values.columns.tolist()
-
-        # ✅ **Get Features AFTER `ConstantsRemover`**
-        if hasattr(self, 'post_constant_columns_'):
-            all_columns = self.post_constant_columns_
-
-        # Ensure indices match actual columns
-        if self.indices is not None:
-            if all(isinstance(i, str) for i in self.indices):
-                self.selected_columns_ = [col for col in self.indices if col in all_columns]
-                self.selected_indices_ = [all_columns.index(col) for col in self.selected_columns_]
-            elif all(isinstance(i, int) for i in self.indices):
-                self.selected_indices_ = [i for i in self.indices if i < len(all_columns)]
-                self.selected_columns_ = [all_columns[i] for i in self.selected_indices_]
-            else:
-                raise ValueError("indices must be a list of column names (str) or indices (int).")
-        else:
-            self.selected_columns_ = all_columns
-            self.selected_indices_ = list(range(len(all_columns)))
-
-        print(f"\n📌 **Numpyfier Fit Complete (After ConstantsRemover)**")
-        print(f"Expected Feature Count: {len(self.selected_columns_)}")
-        print(f"Feature Names: {self.selected_columns_[:10]} ... (truncated)")
+        self.org_mocap_.values.drop(self.org_mocap_.values.index, inplace=True)
 
         return self
 
     def transform(self, X, y=None):
-        """
-        Converts MocapData tracks into NumPy arrays with uniform shape.
-        """
-        print("\n📢 **Numpyfier: Converting MocapData to NumPy array (After ConstantsRemover)**")
-
-        if not X:
-            raise ValueError("Numpyfier received an empty dataset during transform!")
-
-        # Convert each track's DataFrame into a NumPy array, filtering by selected indices
+        #print("Numpyfier")
         Q = []
-        for i, track in enumerate(X):
-            try:
-                filtered_data = track.values.iloc[:, self.selected_indices_].to_numpy()
-                Q.append(filtered_data)
-            except Exception as e:
-                print(f"⚠️ Error processing track {i}: {e}")
-
-        # Determine max sequence length and feature count
-        max_rows = max(track.shape[0] for track in Q)
-        max_cols = max(track.shape[1] for track in Q)
-
-        print(f"🛠 Padding sequences to uniform shape: (max {max_rows} frames, {max_cols} features)")
-
-        # Pad tracks to the same shape with zeros
-        padded_Q = [np.pad(track, ((0, max_rows - track.shape[0]), (0, max_cols - track.shape[1])) ,
-                            mode='constant', constant_values=0) for track in Q]
-
-        stacked_array = np.stack(padded_Q)
-
-        print(f"✅ Final Data Shape: {stacked_array.shape} (samples, time, features)")
-        return stacked_array
+        
+        for track in X:
+            Q.append(track.values.values)
+            #print("Numpyfier:" + str(track.values.columns))
+            
+        return np.array(Q)
 
     def inverse_transform(self, X, copy=None):
-        """
-        Converts NumPy arrays back into MocapData objects with original column names.
-        """
-        print("\n🔄 **Numpyfier: Performing inverse transformation**")
-
         Q = []
-        actual_feature_count = X.shape[2]
 
-        # ✅ **Ensure Feature Count Matches**
-        if actual_feature_count != len(self.selected_columns_):
-            print(f"⚠️ Feature count mismatch in inverse_transform: Expected {len(self.selected_columns_)}, Got {actual_feature_count}")
-            print(f"📌 Adjusting column list to match actual data...")
-
-            # Trim feature names if too many, extend with placeholders if too few
-            self.selected_columns_ = self.selected_columns_[:actual_feature_count]
-
-        for i, track in enumerate(X):
-            # Clone the original structure
+        for track in X:
             new_mocap = self.org_mocap_.clone()
+            time_index = pd.to_timedelta([f for f in range(track.shape[0])], unit='s')*self.org_mocap_.framerate
 
-            if track.shape[1] != len(self.selected_columns_):
-                print(f"⚠️ Shape mismatch in track {i}: Expected {len(self.selected_columns_)}, Got {track.shape[1]}")
-                continue  # Skip this track to avoid crashes
-
-            # Create time index (assuming uniform time step)
-            time_index = pd.RangeIndex(start=0, stop=track.shape[0], step=1)
-
-            # Recreate DataFrame using selected columns
-            new_df = pd.DataFrame(data=track, index=time_index, columns=self.selected_columns_)
-
-            # Assign back to MocapData object
+            new_df =  pd.DataFrame(data=track, index=time_index, columns=self.org_mocap_.values.columns)
+            
             new_mocap.values = new_df
+            
+
             Q.append(new_mocap)
 
-        print(f"✅ Successfully converted {len(Q)} tracks back to MocapData format.")
         return Q
+
+
+# class Numpyfier(BaseEstimator, TransformerMixin):
+#     """
+#     Converts MocapData objects into NumPy arrays for model training.
+#     Ensures selected features match post-ConstantsRemover output.
+#     """
+
+#     def __init__(self, indices=None):
+#         """
+#         :param indices: List of column names OR indices to keep. If None, keeps all columns AFTER preprocessing.
+#         """
+#         self.indices = indices
+#         self.selected_indices_ = None
+#         self.selected_columns_ = None
+#         self.org_mocap_ = None
+
+#     def fit(self, X, y=None):
+#         """
+#         Determines which columns to keep based on `ConstantsRemover` output.
+#         """
+#         if not X:
+#             raise ValueError("Numpyfier received an empty dataset!")
+
+#         # Clone the first MocapData instance as a reference
+#         self.org_mocap_ = X[0].clone()
+#         self.org_mocap_.values = self.org_mocap_.values.iloc[:0]  # Keep structure but remove rows
+
+#         all_columns = self.org_mocap_.values.columns.tolist()
+
+#         #**Get Features AFTER `ConstantsRemover`**
+#         if hasattr(self, 'post_constant_columns_'):
+#             all_columns = self.post_constant_columns_
+
+#         # Ensure indices match actual columns
+#         if self.indices is not None:
+#             if all(isinstance(i, str) for i in self.indices):
+#                 self.selected_columns_ = [col for col in self.indices if col in all_columns]
+#                 self.selected_indices_ = [all_columns.index(col) for col in self.selected_columns_]
+#             elif all(isinstance(i, int) for i in self.indices):
+#                 self.selected_indices_ = [i for i in self.indices if i < len(all_columns)]
+#                 self.selected_columns_ = [all_columns[i] for i in self.selected_indices_]
+#             else:
+#                 raise ValueError("indices must be a list of column names (str) or indices (int).")
+#         else:
+#             self.selected_columns_ = all_columns
+#             self.selected_indices_ = list(range(len(all_columns)))
+
+#         print(f"\n**Numpyfier Fit Complete (After ConstantsRemover)**")
+#         print(f"Expected Feature Count: {len(self.selected_columns_)}")
+#         print(f"Feature Names: {self.selected_columns_}")
+
+#         return self
+
+#     def transform(self, X, y=None):
+#         """
+#         Converts MocapData tracks into NumPy arrays with uniform shape.
+#         """
+#         print("\n**Numpyfier: Converting MocapData to NumPy array (After ConstantsRemover)**")
+
+#         if not X:
+#             raise ValueError("Numpyfier received an empty dataset during transform!")
+
+#         # Convert each track's DataFrame into a NumPy array, filtering by selected indices
+#         Q = []
+#         for i, track in enumerate(X):
+#             try:
+#                 filtered_data = track.values.iloc[:, self.selected_indices_].to_numpy()
+#                 Q.append(filtered_data)
+#             except Exception as e:
+#                 print(f"⚠️ Error processing track {i}: {e}")
+
+#         # Determine max sequence length and feature count
+#         max_rows = max(track.shape[0] for track in Q)
+#         max_cols = max(track.shape[1] for track in Q)
+
+#         # Pad tracks to the same shape with zeros
+#         padded_Q = [np.pad(track, ((0, max_rows - track.shape[0]), (0, max_cols - track.shape[1])) ,
+#                             mode='constant', constant_values=0) for track in Q]
+
+#         stacked_array = np.stack(padded_Q)
+
+#         print(f"Final Data Shape: {stacked_array.shape} (samples, time, features)")
+#         return stacked_array
+
+#     def inverse_transform(self, X, copy=None):
+#         """
+#         Converts NumPy arrays back into MocapData objects with original column names.
+#         """
+#         print("\n🔄 **Numpyfier: Performing inverse transformation**")
+
+#         Q = []
+#         actual_feature_count = X.shape[2]
+
+#         # **Ensure Feature Count Matches**
+#         if actual_feature_count != len(self.selected_columns_):
+#             print(f"⚠️ Feature count mismatch in inverse_transform: Expected {len(self.selected_columns_)}, Got {actual_feature_count}")
+#             print(f"Adjusting column list to match actual data...")
+
+#             # Trim feature names if too many, extend with placeholders if too few
+#             self.selected_columns_ = self.selected_columns_[:actual_feature_count]
+
+#         for i, track in enumerate(X):
+#             # Clone the original structure
+#             new_mocap = self.org_mocap_.clone()
+
+#             if track.shape[1] != len(self.selected_columns_):
+#                 print(f"⚠️ Shape mismatch in track {i}: Expected {len(self.selected_columns_)}, Got {track.shape[1]}")
+#                 continue  # Skip this track to avoid crashes
+
+#             # Create time index (assuming uniform time step)
+#             time_index = pd.RangeIndex(start=0, stop=track.shape[0], step=1)
+
+#             # Recreate DataFrame using selected columns
+#             new_df = pd.DataFrame(data=track, index=time_index, columns=self.selected_columns_)
+
+#             # Assign back to MocapData object
+#             new_mocap.values = new_df
+#             Q.append(new_mocap)
+
+#         print(f"Successfully converted {len(Q)} tracks back to MocapData format.")
+#         return Q
+
+
+# class Numpyfier_New(BaseEstimator, TransformerMixin):
+#     def __init__(self, indices=None, force_required=True):
+#         self.indices = indices
+#         self.force_required = force_required
+#         self.selected_indices_ = None
+#         self.selected_columns_ = None
+#         self.full_columns_ = None
+#         self.org_mocap_ = None
+
+#     def fit(self, X, y=None):
+#         if not X: raise ValueError("Empty dataset")
+#         self.org_mocap_ = X[0].clone()
+#         self.org_mocap_.values = self.org_mocap_.values.iloc[:0]
+
+#         all_cols = X[0].values.columns.tolist()
+#         self.full_columns_ = list(all_cols)
+
+#         # resolve indices
+#         if self.indices is None:
+#             chosen = list(all_cols)
+#         elif all(isinstance(i, str) for i in self.indices):
+#             unknown = [c for c in self.indices if c not in all_cols]
+#             if unknown: raise ValueError(f"Unknown columns: {unknown}")
+#             chosen = list(self.indices)
+#         elif all(isinstance(i, int) for i in self.indices):
+#             bad = [i for i in self.indices if i < 0 or i >= len(all_cols)]
+#             if bad: raise ValueError(f"Out-of-range indices: {bad}")
+#             chosen = [all_cols[i] for i in self.indices]
+#         else:
+#             raise ValueError("indices must be all str or all int")
+
+#         # force-include required schema
+#         if self.force_required:
+#             root = getattr(X[0], "root_name", "Hips")
+#             required = [f"{root}_Xposition", f"{root}_Yposition", f"{root}_Zposition"]
+#             for r in required:
+#                 if r in all_cols and r not in chosen:
+#                     chosen.append(r)  # append but keep user order otherwise
+
+#         self.selected_columns_ = chosen
+#         self.selected_indices_ = [all_cols.index(c) for c in self.selected_columns_]
+#         return self
+
+#     def transform(self, X, y=None):
+#         arrays = [t.values.iloc[:, self.selected_indices_].to_numpy() for t in X]
+#         T = max(a.shape[0] for a in arrays)
+#         F = arrays[0].shape[1]
+#         arrays = [np.pad(a, ((0, T - a.shape[0]), (0, 0)), mode="edge") for a in arrays]
+#         return np.stack(arrays)
+
+#     def inverse_transform(self, X, copy=None):
+#         # rebuild only the selected columns; downstream still has required cols
+#         out = []
+#         for sample in X:
+#             df = pd.DataFrame(sample, columns=self.selected_columns_)
+#             m = self.org_mocap_.clone()
+#             # Keep only selected columns; later steps shouldn't need missing now
+#             m.values = df
+#             out.append(m)
+#         return out
+
+
 
 
 class Slicer(BaseEstimator, TransformerMixin):
@@ -2454,4 +2496,128 @@ class ColumnDropper(BaseEstimator, TransformerMixin):
                     df[col] = 0.0
         return df
 
+
+class PositionDropper(BaseEstimator, TransformerMixin):
+    """
+    Drops all per-joint position channels (*_Xposition, *_Yposition, *_Zposition)
+    while keeping specified exceptions. By default, keeps 'Hips_Yposition'.
+    Caches dropped columns per track so inverse_transform restores originals.
+    """
+
+    def __init__(self,
+                 keep_root_y: bool = False,
+                 keep_names: list = None,
+                 default_keep_hips_y: bool = True):
+        """
+        Args:
+            keep_root_y: If True, also keep '<root_name>_Yposition' for each track.
+            keep_names: Additional column names to preserve (list of strings).
+            default_keep_hips_y: Keep 'Hips_Yposition' explicitly (case-sensitive).
+        """
+        self.keep_root_y = keep_root_y
+        self.keep_names = list(keep_names) if keep_names else []
+        self.default_keep_hips_y = default_keep_hips_y
+
+        # learned/derived state
+        self.drop_cols_ = None    # columns to drop (computed per the first fit schema)
+        self.keep_set_ = None     # names to keep based on init + (optionally) root at transform-time
+        self.schema_ = None       # full schema for sanity checks
+
+        # per-transform cache: list of dicts {col_name: pd.Series} aligned to input order
+        self._cache_per_track_ = None
+
+    def _compute_drop_cols(self, columns, root_name=None):
+        """Return (drop_cols, keep_set) based on current settings and provided schema."""
+        keep_set = set(self.keep_names)
+        if self.default_keep_hips_y:
+            keep_set.add("Hips_Yposition")
+        if self.keep_root_y and root_name:
+            keep_set.add(f"{root_name}_Yposition")
+
+        pos_cols = [c for c in columns
+                    if c.endswith("_Xposition") or c.endswith("_Yposition") or c.endswith("_Zposition")]
+        drop_cols = [c for c in pos_cols if c not in keep_set]
+        return drop_cols, keep_set
+
+    def fit(self, X, y=None):
+        if not X:
+            raise ValueError("PositionDropper received an empty dataset in fit().")
+        # Use the first track to snapshot the schema; we recompute per-track keeps at transform time
+        cols = X[0].values.columns.tolist()
+        self.schema_ = list(cols)
+
+        # Compute an initial drop list assuming root from first track (safe; will refine per track)
+        root_name = getattr(X[0], "root_name", None)
+        self.drop_cols_, self.keep_set_ = self._compute_drop_cols(cols, root_name=root_name)
+        return self
+
+    def transform(self, X, y=None):
+        if not X:
+            raise ValueError("PositionDropper received an empty dataset in transform().")
+
+        self._cache_per_track_ = []
+        Q = []
+
+        for track in X:
+            df = track.values
+            if self.schema_ is None:
+                self.schema_ = df.columns.tolist()
+
+            # Recompute drop columns for this track using its root (if asked to keep root Y)
+            root_name = getattr(track, "root_name", None)
+            drop_cols, _ = self._compute_drop_cols(df.columns.tolist(), root_name=root_name)
+
+            # Cache the exact position columns we will drop (full time series, no fabrication)
+            cache = {c: df[c].copy() for c in drop_cols if c in df.columns}
+            self._cache_per_track_.append(cache)
+
+            t2 = track.clone()
+            if drop_cols:
+                t2.values = df.drop(columns=drop_cols, errors="ignore")
+            else:
+                t2.values = df.copy()
+            Q.append(t2)
+
+        return Q
+
+    def inverse_transform(self, X, copy=None):
+        if self._cache_per_track_ is None:
+            raise RuntimeError("No cached positions to restore. Call transform() before inverse_transform().")
+
+        if len(X) != len(self._cache_per_track_):
+            # Defensive: if batch sizes differ, we restore what we can
+            print("⚠️ PositionDropper: mismatch between cached tracks and input; restoring by index overlap.")
+
+        Q = []
+        for i, track in enumerate(X):
+            t2 = track.clone()
+            df = t2.values.copy()
+
+            cache = self._cache_per_track_[i] if i < len(self._cache_per_track_) else {}
+
+            # Restore each cached column, aligning length if needed
+            T = len(df.index)
+            for col, series in cache.items():
+                if len(series) == T:
+                    df[col] = series.values
+                elif len(series) > T:
+                    # truncate (common if later steps trimmed/padded)
+                    df[col] = series.iloc[:T].values
+                else:
+                    # pad by repeating last known value to match current length
+                    pad_val = series.iloc[-1] if len(series) > 0 else 0.0
+                    pad = np.full(T - len(series), pad_val, dtype=float)
+                    df[col] = np.concatenate([series.values, pad], axis=0)
+
+            # (Optional) reorder to original schema if all columns present
+            if self.schema_:
+                # put known columns first, then any extras
+                ordered = [c for c in self.schema_ if c in df.columns]
+                extras = [c for c in df.columns if c not in ordered]
+                df = df[ordered + extras]
+
+            t2.values = df
+            Q.append(t2)
+
+        return Q
 
