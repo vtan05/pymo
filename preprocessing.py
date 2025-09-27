@@ -2372,6 +2372,9 @@ class FeatureCounter(BaseEstimator, TransformerMixin):
         return X
 
     def inverse_transform(self, X, copy=None):
+        if isinstance(X, list):
+            X = np.array(X)   # convert list to numpy array
+
         self.n_features = X.shape[-1]
         print(f"🔄 Updated Feature Count: {self.n_features}")
         return X
@@ -2433,127 +2436,189 @@ class ColumnDropper(BaseEstimator, TransformerMixin):
         return df
 
 
+import numpy as np
+import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin
+
 class PositionDropper(BaseEstimator, TransformerMixin):
     """
     Drops all per-joint position channels (*_Xposition, *_Yposition, *_Zposition)
-    while keeping specified exceptions. By default, keeps 'Hips_Yposition'.
+    while keeping specified exceptions. By default, keeps 'Hips_Yposition' (configurable).
     Caches dropped columns per track so inverse_transform restores originals.
+    ColumnDropper-like behavior for list/single inputs and .values DataFrames.
     """
 
     def __init__(self,
                  keep_root_y: bool = False,
                  keep_names: list = None,
-                 default_keep_hips_y: bool = True):
+                 default_keep_hips_y: bool = True,
+                 root_candidates: list = None):
         """
         Args:
-            keep_root_y: If True, also keep '<root_name>_Yposition' for each track.
-            keep_names: Additional column names to preserve (list of strings).
+            keep_root_y: If True, keep '<root>_Yposition' for any detected root name(s).
+            keep_names: Extra exact column names to preserve.
             default_keep_hips_y: Keep 'Hips_Yposition' explicitly (case-sensitive).
+            root_candidates: Candidate root joint names to check (e.g., Hips, Root, Pelvis).
         """
         self.keep_root_y = keep_root_y
         self.keep_names = list(keep_names) if keep_names else []
         self.default_keep_hips_y = default_keep_hips_y
+        self.root_candidates = root_candidates or ["Hips", "Root", "root", "Pelvis", "pelvis"]
 
-        # learned/derived state
-        self.drop_cols_ = None    # columns to drop (computed per the first fit schema)
-        self.keep_set_ = None     # names to keep based on init + (optionally) root at transform-time
-        self.schema_ = None       # full schema for sanity checks
+        # Filled during transform
+        self._cache_per_track = None      # list[dict[col -> pd.Series]]
+        self._schema_per_track = None     # list[list[str]]
 
-        # per-transform cache: list of dicts {col_name: pd.Series} aligned to input order
-        self._cache_per_track_ = None
+        self._pos_suffixes = ("_Xposition", "_Yposition", "_Zposition")
 
-    def _compute_drop_cols(self, columns, root_name=None):
-        """Return (drop_cols, keep_set) based on current settings and provided schema."""
-        keep_set = set(self.keep_names)
-        if self.default_keep_hips_y:
-            keep_set.add("Hips_Yposition")
-        if self.keep_root_y and root_name:
-            keep_set.add(f"{root_name}_Yposition")
+    # ---------- helpers ----------
 
-        pos_cols = [c for c in columns
-                    if c.endswith("_Xposition") or c.endswith("_Yposition") or c.endswith("_Zposition")]
-        drop_cols = [c for c in pos_cols if c not in keep_set]
-        return drop_cols, keep_set
+    def _is_iterable_tracks(self, X):
+        return hasattr(X, '__iter__') and not isinstance(X, (dict, str, bytes, bytearray))
+
+    def _get_df(self, obj):
+        """
+        Accepts either a track-like object with .values (DataFrame) or a DataFrame.
+        Returns (df, setter, container). If container is None, caller should return df itself.
+        """
+        if hasattr(obj, 'values') and isinstance(obj.values, pd.DataFrame):
+            def setter(new_df):
+                obj.values = new_df
+            return obj.values, setter, obj
+        elif isinstance(obj, pd.DataFrame):
+            def setter(new_df):
+                # no-op: we will return the new df
+                pass
+            return obj, setter, None
+        else:
+            raise TypeError("PositionDropper expected an object with .values(DataFrame) or a pandas DataFrame.")
+
+    def _detect_keep_set(self, cols):
+        keep = set(self.keep_names)
+        if self.default_keep_hips_y and "Hips_Yposition" in cols:
+            keep.add("Hips_Yposition")
+        if self.keep_root_y:
+            for root in self.root_candidates:
+                col = f"{root}_Yposition"
+                if col in cols:
+                    keep.add(col)
+        return keep
+
+    def _position_columns(self, cols):
+        return [c for c in cols if c.endswith(self._pos_suffixes)]
+
+    # ---------- sklearn API ----------
 
     def fit(self, X, y=None):
-        if not X:
-            raise ValueError("PositionDropper received an empty dataset in fit().")
-        # Use the first track to snapshot the schema; we recompute per-track keeps at transform time
-        cols = X[0].values.columns.tolist()
-        self.schema_ = list(cols)
-
-        # Compute an initial drop list assuming root from first track (safe; will refine per track)
-        root_name = getattr(X[0], "root_name", None)
-        self.drop_cols_, self.keep_set_ = self._compute_drop_cols(cols, root_name=root_name)
+        # stateless
         return self
 
     def transform(self, X, y=None):
-        if not X:
-            raise ValueError("PositionDropper received an empty dataset in transform().")
+        if self._is_iterable_tracks(X):
+            self._cache_per_track = []
+            self._schema_per_track = []
+            out = []
+            for obj in X:
+                df, setter, container = self._get_df(obj)
+                cols = list(df.columns)
+                self._schema_per_track.append(cols)
 
-        self._cache_per_track_ = []
-        Q = []
+                keep = self._detect_keep_set(cols)
+                pos_cols = self._position_columns(cols)
+                to_drop = [c for c in pos_cols if c not in keep]
 
-        for track in X:
-            df = track.values
-            if self.schema_ is None:
-                self.schema_ = df.columns.tolist()
+                cache = {c: df[c].copy() for c in to_drop if c in df.columns}
+                self._cache_per_track.append(cache)
 
-            # Recompute drop columns for this track using its root (if asked to keep root Y)
-            root_name = getattr(track, "root_name", None)
-            drop_cols, _ = self._compute_drop_cols(df.columns.tolist(), root_name=root_name)
+                new_df = df.drop(columns=to_drop, errors="ignore") if to_drop else df.copy()
 
-            # Cache the exact position columns we will drop (full time series, no fabrication)
-            cache = {c: df[c].copy() for c in drop_cols if c in df.columns}
-            self._cache_per_track_.append(cache)
+                if container is None:
+                    out.append(new_df)
+                else:
+                    setter(new_df)
+                    out.append(obj)
+            return out
+        else:
+            self._cache_per_track = []
+            self._schema_per_track = []
+            df, setter, container = self._get_df(X)
+            cols = list(df.columns)
+            self._schema_per_track.append(cols)
 
-            t2 = track.clone()
-            if drop_cols:
-                t2.values = df.drop(columns=drop_cols, errors="ignore")
+            keep = self._detect_keep_set(cols)
+            pos_cols = self._position_columns(cols)
+            to_drop = [c for c in pos_cols if c not in keep]
+
+            cache = {c: df[c].copy() for c in to_drop if c in df.columns}
+            self._cache_per_track.append(cache)
+
+            new_df = df.drop(columns=to_drop, errors="ignore") if to_drop else df.copy()
+
+            if container is None:
+                return new_df
             else:
-                t2.values = df.copy()
-            Q.append(t2)
-
-        return Q
+                setter(new_df)
+                return X
 
     def inverse_transform(self, X, copy=None):
-        if self._cache_per_track_ is None:
-            raise RuntimeError("No cached positions to restore. Call transform() before inverse_transform().")
+        # If no cache, behave like a no-op (ColumnDropper style)
+        if self._cache_per_track is None or self._schema_per_track is None:
+            return X
 
-        if len(X) != len(self._cache_per_track_):
-            # Defensive: if batch sizes differ, we restore what we can
-            print("⚠️ PositionDropper: mismatch between cached tracks and input; restoring by index overlap.")
-
-        Q = []
-        for i, track in enumerate(X):
-            t2 = track.clone()
-            df = t2.values.copy()
-
-            cache = self._cache_per_track_[i] if i < len(self._cache_per_track_) else {}
-
-            # Restore each cached column, aligning length if needed
+        def _restore_one(obj, cache, orig_schema):
+            df, setter, container = self._get_df(obj)
             T = len(df.index)
-            for col, series in cache.items():
-                if len(series) == T:
-                    df[col] = series.values
-                elif len(series) > T:
-                    # truncate (common if later steps trimmed/padded)
-                    df[col] = series.iloc[:T].values
-                else:
-                    # pad by repeating last known value to match current length
-                    pad_val = series.iloc[-1] if len(series) > 0 else 0.0
-                    pad = np.full(T - len(series), pad_val, dtype=float)
-                    df[col] = np.concatenate([series.values, pad], axis=0)
 
-            # (Optional) reorder to original schema if all columns present
-            if self.schema_:
-                # put known columns first, then any extras
-                ordered = [c for c in self.schema_ if c in df.columns]
+            if cache:
+                # Align cached series lengths (pad/truncate), then batch-restore
+                aligned = {}
+                for col, series in cache.items():
+                    n = len(series)
+                    if n == T:
+                        aligned[col] = series.values
+                    elif n > T:
+                        aligned[col] = series.iloc[:T].values
+                    else:
+                        pad_val = series.iloc[-1] if n > 0 else 0.0
+                        aligned[col] = np.concatenate([series.values, np.full(T - n, pad_val, dtype=float)], axis=0)
+
+                if aligned:
+                    new_cols = pd.DataFrame(aligned, index=df.index)
+
+                    # Overlapping columns: one-shot assignment
+                    overlap_cols = [c for c in new_cols.columns if c in df.columns]
+                    if len(overlap_cols) > 0:
+                        df.loc[:, overlap_cols] = new_cols[overlap_cols].to_numpy()
+                        new_cols = new_cols.drop(columns=overlap_cols)
+
+                    # New columns: single concat
+                    if not new_cols.empty:
+                        df = pd.concat([df, new_cols], axis=1)
+
+            # Reorder to original schema, keep extras at the end
+            if orig_schema:
+                ordered = [c for c in orig_schema if c in df.columns]
                 extras = [c for c in df.columns if c not in ordered]
                 df = df[ordered + extras]
 
-            t2.values = df
-            Q.append(t2)
+            # Defragment per pandas recommendation
+            df = df.copy()
 
-        return Q
+            if container is None:
+                return df
+            else:
+                setter(df)
+                return obj
+
+        if self._is_iterable_tracks(X):
+            out = []
+            for i, obj in enumerate(X):
+                cache = self._cache_per_track[i] if i < len(self._cache_per_track) else {}
+                schema = self._schema_per_track[i] if i < len(self._schema_per_track) else None
+                out.append(_restore_one(obj, cache, schema))
+            return out
+        else:
+            cache = self._cache_per_track[0] if self._cache_per_track else {}
+            schema = self._schema_per_track[0] if self._schema_per_track else None
+            return _restore_one(X, cache, schema)
 
