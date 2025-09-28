@@ -1,76 +1,101 @@
 import numpy as np
 import pandas as pd
 
-class BVHWriter():
-    def __init__(self):
-        pass
-    
+class BVHWriter:
+    def __init__(self, strict=False, warn_missing=True):
+        """
+        strict: if True, raise if a required column is missing.
+        warn_missing: if True, print a summary of zero-filled columns after writing.
+        """
+        self.strict = strict
+        self.warn_missing = warn_missing
+
     def write(self, X, ofile, framerate=-1, start=0, stop=-1):
-        
-        # Writing the skeleton info
-        ofile.write('HIERARCHY\n')
-        
+        """X: MocapData-like with .values (DataFrame), .skeleton, .root_name, .framerate"""
+        self._missing_notes = []
         self.motions_ = []
+
+        # --- Hierarchy ---
+        ofile.write('HIERARCHY\n')
         self._printJoint(X, X.root_name, 0, ofile)
 
+        # --- Motion header ---
         if stop > 0:
-            nframes = stop-start
+            nframes = stop - start
         else:
             nframes = X.values.shape[0]
             stop = X.values.shape[0]
 
-        # Writing the motion header
         ofile.write('MOTION\n')
-        ofile.write('Frames: %d\n'%nframes)
-        
+        ofile.write('Frames: %d\n' % nframes)
         if framerate > 0:
-            ofile.write('Frame Time: %f\n'%float(1.0/framerate))
+            ofile.write('Frame Time: %0.6f\n' % (1.0 / float(framerate)))
         else:
-            ofile.write('Frame Time: %f\n'%X.framerate)
+            ofile.write('Frame Time: %0.6f\n' % float(X.framerate))
 
-        # Writing the data
-        self.motions_ = np.asarray(self.motions_).T
-        lines = [" ".join(item) for item in self.motions_[start:stop].astype(str)]
-        ofile.write("".join("%s\n"%l for l in lines))
+        # --- Data ---
+        data = np.asarray(self.motions_).T  # (T, nchannels)
+        lines = [" ".join(item) for item in data[start:stop].astype(str)]
+        ofile.write("".join("%s\n" % l for l in lines))
+
+        if self.warn_missing and self._missing_notes:
+            print("[BVHWriter] Missing columns were filled with zeros:")
+            for note in self._missing_notes:
+                print("  -", note)
 
     def _printJoint(self, X, joint, tab, ofile):
-        
-        if X.skeleton[joint]['parent'] == None:
-            ofile.write('ROOT %s\n'%joint)
-        elif len(X.skeleton[joint]['children']) > 0:
-            ofile.write('%sJOINT %s\n'%('\t'*(tab), joint))
+        sk = X.skeleton
+        is_root = (sk[joint]['parent'] is None)
+        is_end  = (len(sk[joint]['children']) == 0)
+
+        indent = '\t' * tab
+
+        # Node header
+        if is_root:
+            ofile.write('ROOT %s\n' % joint)
+        elif is_end:
+            ofile.write('%sEnd Site\n' % indent)
         else:
-            ofile.write('%sEnd site\n'%('\t'*(tab)))
+            ofile.write('%sJOINT %s\n' % (indent, joint))
 
-        ofile.write('%s{\n'%('\t'*(tab)))
-        
-        ofile.write('%sOFFSET %3.5f %3.5f %3.5f\n'%('\t'*(tab+1),
-                                                X.skeleton[joint]['offsets'][0],
-                                                X.skeleton[joint]['offsets'][1],
-                                                X.skeleton[joint]['offsets'][2]))
-        rot_order = X.skeleton[joint]['order']
-        
-        #print("rot_order = " + rot_order)
-        channels = X.skeleton[joint]['channels']
-        rot = [c for c in channels if ('rotation' in c)]
-        pos = [c for c in channels if ('position' in c)]
-        
-        n_channels = len(rot) +len(pos)
-        ch_str = ''
-        if n_channels > 0:
-            for ci in range(len(pos)):
-                cn = pos[ci]
-                self.motions_.append(np.asarray(X.values['%s_%s'%(joint,cn)].values))
-                ch_str = ch_str + ' ' + cn 
-            for ci in range(len(rot)):
-                cn = '%srotation'%(rot_order[ci])
-                self.motions_.append(np.asarray(X.values['%s_%s'%(joint,cn)].values))
-                ch_str = ch_str + ' ' + cn 
-        if len(X.skeleton[joint]['children']) > 0:
-            #ch_str = ''.join(' %s'*n_channels%tuple(channels))
-            ofile.write('%sCHANNELS %d%s\n' %('\t'*(tab+1), n_channels, ch_str)) 
+        ofile.write('%s{\n' % indent)
 
-            for c in X.skeleton[joint]['children']:
-                self._printJoint(X, c, tab+1, ofile)
+        # OFFSET
+        off = sk[joint]['offsets']
+        ofile.write('%sOFFSET %0.5f %0.5f %0.5f\n' % ('\t'*(tab+1), off[0], off[1], off[2]))
 
-        ofile.write('%s}\n'%('\t'*(tab)))
+        # End Site: close and return (no channels)
+        if is_end:
+            ofile.write('%s}\n' % indent)
+            return
+
+        # CHANNELS: root has XYZ position + 3 rotations; others have 3 rotations only
+        order = sk[joint].get('order', 'XYZ')
+        rot_names = ['%srotation' % order[i] for i in range(3)]
+        pos_names = ['Xposition', 'Yposition', 'Zposition'] if is_root else []
+        channels = pos_names + rot_names
+
+        ch_str = ''.join(' %s' % c for c in channels)
+        ofile.write('%sCHANNELS %d%s\n' % ('\t'*(tab+1), len(channels), ch_str))
+
+        # Append motion arrays, zero-filling if missing
+        T = len(X.values.index)
+        for cname in pos_names:
+            self._append_channel(X, joint, '%s_%s' % (joint, cname), T)
+        for cname in rot_names:
+            self._append_channel(X, joint, '%s_%s' % (joint, cname), T)
+
+        # Recurse
+        for child in sk[joint]['children']:
+            self._printJoint(X, child, tab+1, ofile)
+
+        ofile.write('%s}\n' % indent)
+
+    def _append_channel(self, X, joint, col, T):
+        if col in X.values.columns:
+            self.motions_.append(np.asarray(X.values[col].values))
+        else:
+            if self.strict:
+                raise KeyError("Required BVH column missing: %s" % col)
+            self.motions_.append(np.zeros(T))
+            self._missing_notes.append("%s: %s" % (joint, col))
