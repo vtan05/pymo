@@ -22,7 +22,7 @@ from pymo.Pivots import Pivots
 class MocapParameterizer(BaseEstimator, TransformerMixin):
     def __init__(self, param_type = 'euler', ref_pose=None):
         '''
-        param_type = {'euler', 'quat', 'expmap', 'position', 'expmap2pos'}
+        param_type = {'euler', 'quat', 'expmap', 'position', 'expmappos'}
         '''
         self.param_type = param_type
         if (ref_pose is not None):
@@ -47,10 +47,10 @@ class MocapParameterizer(BaseEstimator, TransformerMixin):
             return self._to_quat(X)
         elif self.param_type == 'position':
             return self._to_pos(X)
-        elif self.param_type == 'expmap2pos':
-            return self._expmap_to_pos(X)
+        elif self.param_type == 'expmappos':
+            return self._to_expmappos(X)
         else:
-            raise 'param types: euler, quat, expmap, position, expmap2pos'
+            raise 'param types: euler, quat, expmap, position, expmappos'
     
     def inverse_transform(self, X, copy=None): 
         if self.param_type == 'euler':
@@ -67,8 +67,10 @@ class MocapParameterizer(BaseEstimator, TransformerMixin):
         elif self.param_type == 'position':
             print('positions 2 eulers is not supported')
             return X
+        elif self.param_type == 'expmappos':
+            return self._expmappos_to_euler(X)
         else:
-            raise 'param types: euler, quat, expmap, position'
+            raise 'param types: euler, quat, expmap, position, expmappos'
 
     def _to_quat(self, X):
         '''Converts joints rotations in quaternions'''
@@ -269,74 +271,51 @@ class MocapParameterizer(BaseEstimator, TransformerMixin):
 
         return rotmats
 
-    def _expmap_to_pos(self, X):
-        '''Converts joints rotations in expmap notation to joint positions'''
+    def _to_expmappos(self, X):
+        """
+        Returns tracks where values contain BOTH:
+        - expmap rotation parameters
+        - forward-kinematics joint positions (prefixed with 'fk_')
+        """
+        # First get expmap-only representation
+        Q_exp = self._to_expmap(X)
+        # Then get FK positions
+        Q_pos = self._to_pos(X)
 
         Q = []
-        for track in X:
-            channels = []
-            titles = []
-            exp_df = track.values
+        for track_exp, track_pos in zip(Q_exp, Q_pos):
+            new_track = track_exp.clone()
 
-            # Create a new DataFrame to store the exponential map rep
-            pos_df = pd.DataFrame(index=exp_df.index)
+            # FK positions with a prefix to avoid column name collisions
+            fk_pos_df = track_pos.values.copy()
+            fk_pos_df = fk_pos_df.add_prefix('fk_')
 
-            # List the columns that contain rotation channels
-            exp_params = [c for c in exp_df.columns if ( any(p in c for p in ['alpha', 'beta','gamma']) and 'Nub' not in c)]
-
-            # List the joints that are not end sites, i.e., have channels
-            joints = (joint for joint in track.skeleton)
-
-            tree_data = {}
-                        
-            for joint in track.traverse():
-                parent = track.skeleton[joint]['parent']
-                
-                if 'Nub' not in joint:
-                    r = exp_df[[c for c in exp_params if joint in c]] # Get the columns that belong to this joint
-                    expmap = r.values
-                    #expmap = [[f[1]['%s_alpha'%joint], f[1]['%s_beta'%joint], f[1]['%s_gamma'%joint]] for f in r.iterrows()]
-                else:
-                    expmap = np.zeros((exp_df.shape[0], 3))
-
-                # Convert the eulers to rotation matrices
-                #rotmats = np.asarray([Rotation(f, 'expmap').rotmat for f in expmap])
-                #angs = np.linalg.norm(expmap,axis=1, keepdims=True)
-                rotmats = self._expmap2rot(expmap)
-                
-                tree_data[joint]=[
-                                    [], # to store the rotation matrix
-                                    []  # to store the calculated position
-                                 ] 
-                pos_values = np.zeros((exp_df.shape[0], 3))
-
-                if track.root_name == joint:
-                    tree_data[joint][0] = rotmats
-                    # tree_data[joint][1] = np.add(pos_values, track.skeleton[joint]['offsets'])
-                    tree_data[joint][1] = pos_values
-                else:
-                    # for every frame i, multiply this joint's rotmat to the rotmat of its parent
-                    tree_data[joint][0] = np.matmul(rotmats, tree_data[parent][0])
-
-                    # add the position channel to the offset and store it in k, for every frame i
-                    k = pos_values + track.skeleton[joint]['offsets']
-
-                    # multiply k to the rotmat of the parent for every frame i
-                    q = np.matmul(k.reshape(k.shape[0],1,3), tree_data[parent][0])
-
-                    # add q to the position of the parent, for every frame i
-                    tree_data[joint][1] = q.reshape(k.shape[0],3) + tree_data[parent][1]
-
-
-                # Create the corresponding columns in the new DataFrame
-                df = pd.DataFrame(data=tree_data[joint][1], 
-                                  index=pos_df.index, 
-                                  columns=['%s_Xposition'%joint, '%s_Yposition'%joint, '%s_Zposition'%joint])
-                pos_df = pd.concat((pos_df, df), axis=1)
-
-            new_track = track.clone()
-            new_track.values = pos_df
+            # Concatenate expmap (and any original non-rot cols) with FK positions
+            new_values = pd.concat([new_track.values, fk_pos_df], axis=1)
+            new_track.values = new_values
             Q.append(new_track)
+
+        return Q
+
+    def _expmappos_to_euler(self, X):
+        """
+        Inverse for param_type='expmap2pos':
+        - Remove FK position columns (starting with 'fk_')
+        - Convert remaining expmap columns back to Euler angles.
+        """
+        Q = []
+        for track in X:
+            # Work on a clone to avoid in-place side effects if not desired
+            t = track.clone()
+            # Drop FK position columns
+            cols_to_drop = [c for c in t.values.columns if c.startswith('fk_')]
+            if len(cols_to_drop) > 0:
+                t.values = t.values.drop(columns=cols_to_drop)
+
+            # Now t looks like a regular expmap track, reuse existing logic
+            euler_tracks = self._expmap_to_euler([t])
+            Q.append(euler_tracks[0])
+
         return Q
 
     def _to_expmap(self, X):
@@ -2426,6 +2405,155 @@ class ColumnDropper(BaseEstimator, TransformerMixin):
         return df
 
 
+# class PositionDropper(BaseEstimator, TransformerMixin):
+#     """
+#     ConstantsRemover-style position dropper:
+#       - fit(): decide once which *_Xposition/_Yposition/_Zposition to drop
+#       - transform(): drop them & cache originals per track
+#       - inverse_transform(): restore from cache in one batch
+#     Crucially: keeps root XYZ so upstream inverse steps (e.g., RootTransformer) never KeyError.
+#     """
+
+#     def __init__(self,
+#                  keep_root_xyz: bool = True,
+#                  keep_names: list = None,
+#                  root_candidates: list = None):
+#         self.keep_root_xyz = keep_root_xyz
+#         self.keep_names = list(keep_names) if keep_names else []
+#         self.root_candidates = root_candidates or ["Hips", "Root", "Pelvis", "root", "pelvis"]
+
+#         # learned in fit()
+#         self.drop_cols_ = []
+#         self.schema_ = None
+
+#         # filled in transform()
+#         self._cache_per_track_ = None  # list[pd.DataFrame] of dropped columns per track
+
+#         self._pos_suffixes = ("_Xposition", "_Yposition", "_Zposition")
+
+#     # ---------- helpers ----------
+
+#     def _get_df(self, obj):
+#         """Return (df, setter, is_track_obj)."""
+#         if hasattr(obj, "values") and isinstance(obj.values, pd.DataFrame):
+#             def setter(new_df): obj.values = new_df
+#             return obj.values, setter, True
+#         elif isinstance(obj, pd.DataFrame):
+#             def setter(new_df): pass  # caller will return df
+#             return obj, setter, False
+#         else:
+#             raise TypeError("Expected track.values (DataFrame) or a pandas DataFrame.")
+
+#     def _position_columns(self, cols):
+#         return [c for c in cols if c.endswith(self._pos_suffixes)]
+
+#     def _build_keep_set(self, cols):
+#         keep = set(self.keep_names)
+#         if self.keep_root_xyz:
+#             # Keep ANY root candidate XYZ that exists in this schema
+#             for r in self.root_candidates:
+#                 for ax in ("X", "Y", "Z"):
+#                     c = f"{r}_{ax}position"
+#                     if c in cols:
+#                         keep.add(c)
+#         return keep
+
+#     # ---------- sklearn API ----------
+
+#     def fit(self, X, y=None):
+#         if not X:
+#             raise ValueError("PositionDropper.fit() received empty X.")
+#         df0, _, _ = self._get_df(X[0])
+#         cols0 = list(df0.columns)
+#         self.schema_ = cols0
+
+#         keep = self._build_keep_set(cols0)
+#         pos_cols = self._position_columns(cols0)
+#         self.drop_cols_ = [c for c in pos_cols if c not in keep]
+
+#         # Debug (optional):
+#         # print("[PositionDropper] Keeping:", sorted(keep))
+#         # print("[PositionDropper] Dropping:", sorted(self.drop_cols_))
+
+#         return self
+
+#     def transform(self, X, y=None):
+#         if not X:
+#             raise ValueError("PositionDropper.transform() received empty X.")
+
+#         self._cache_per_track_ = []
+#         out = []
+
+#         for obj in X:
+#             df, setter, is_track = self._get_df(obj)
+
+#             present_to_drop = [c for c in self.drop_cols_ if c in df.columns]
+#             cache_df = df[present_to_drop].copy() if present_to_drop else pd.DataFrame(index=df.index)
+#             self._cache_per_track_.append(cache_df)
+
+#             new_df = df.drop(columns=present_to_drop, errors="ignore") if present_to_drop else df.copy()
+
+#             if is_track:
+#                 setter(new_df)
+#                 out.append(obj)
+#             else:
+#                 out.append(new_df)
+#         return out
+
+#     def inverse_transform(self, X, copy=None):
+#         if self._cache_per_track_ is None:
+#             return X  # no-op if nothing was dropped
+
+#         def _restore(df, cache_df):
+#             if cache_df is None or cache_df.empty:
+#                 return df
+
+#             T = len(df.index)
+#             # align lengths for all cached columns
+#             aligned = {}
+#             for col in cache_df.columns:
+#                 s = cache_df[col]
+#                 n = len(s)
+#                 if n == T:
+#                     aligned[col] = s.values
+#                 elif n > T:
+#                     aligned[col] = s.iloc[:T].values
+#                 else:
+#                     pad_val = s.iloc[-1] if n > 0 else 0.0
+#                     aligned[col] = np.concatenate([s.values, np.full(T - n, pad_val, dtype=float)], axis=0)
+
+#             add_df = pd.DataFrame(aligned, index=df.index)
+
+#             # Overlaps: single vectorized write
+#             overlap = [c for c in add_df.columns if c in df.columns]
+#             if overlap:
+#                 df.loc[:, overlap] = add_df[overlap].to_numpy()
+#                 add_df = add_df.drop(columns=overlap)
+
+#             # New columns: single concat
+#             if not add_df.empty:
+#                 df = pd.concat([df, add_df], axis=1)
+
+#             # Reorder to original schema if known
+#             if self.schema_:
+#                 ordered = [c for c in self.schema_ if c in df.columns]
+#                 extras = [c for c in df.columns if c not in ordered]
+#                 df = df[ordered + extras]
+
+#             return df.copy()  # defragment
+
+#         out = []
+#         for i, obj in enumerate(X):
+#             df, setter, is_track = self._get_df(obj)
+#             cache_df = self._cache_per_track_[i] if i < len(self._cache_per_track_) else None
+#             new_df = _restore(df, cache_df)
+#             if is_track:
+#                 setter(new_df)
+#                 out.append(obj)
+#             else:
+#                 out.append(new_df)
+#         return out
+
 class PositionDropper(BaseEstimator, TransformerMixin):
     """
     ConstantsRemover-style position dropper:
@@ -2433,15 +2561,20 @@ class PositionDropper(BaseEstimator, TransformerMixin):
       - transform(): drop them & cache originals per track
       - inverse_transform(): restore from cache in one batch
     Crucially: keeps root XYZ so upstream inverse steps (e.g., RootTransformer) never KeyError.
+
+    New option:
+      - keep_fk_positions: if True, columns starting with "fk_" are never dropped.
     """
 
     def __init__(self,
                  keep_root_xyz: bool = True,
                  keep_names: list = None,
-                 root_candidates: list = None):
+                 root_candidates: list = None,
+                 keep_fk_positions: bool = True):
         self.keep_root_xyz = keep_root_xyz
         self.keep_names = list(keep_names) if keep_names else []
         self.root_candidates = root_candidates or ["Hips", "Root", "Pelvis", "root", "pelvis"]
+        self.keep_fk_positions = keep_fk_positions
 
         # learned in fit()
         self.drop_cols_ = []
@@ -2466,7 +2599,12 @@ class PositionDropper(BaseEstimator, TransformerMixin):
             raise TypeError("Expected track.values (DataFrame) or a pandas DataFrame.")
 
     def _position_columns(self, cols):
-        return [c for c in cols if c.endswith(self._pos_suffixes)]
+        """Return position columns that are *eligible* for dropping."""
+        base = [c for c in cols if c.endswith(self._pos_suffixes)]
+        if self.keep_fk_positions:
+            # Never drop FK positions like fk_Hips_Xposition
+            base = [c for c in base if not c.startswith("fk_")]
+        return base
 
     def _build_keep_set(self, cols):
         keep = set(self.keep_names)
