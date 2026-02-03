@@ -22,7 +22,7 @@ from pymo.Pivots import Pivots
 class MocapParameterizer(BaseEstimator, TransformerMixin):
     def __init__(self, param_type = 'euler', ref_pose=None):
         '''
-        param_type = {'euler', 'quat', 'expmap', 'position', 'expmappos'}
+        param_type = {'euler', 'quat', 'expmap', 'position', 'expmappos', '6Dpos'}
         '''
         self.param_type = param_type
         if (ref_pose is not None):
@@ -49,8 +49,10 @@ class MocapParameterizer(BaseEstimator, TransformerMixin):
             return self._to_pos(X)
         elif self.param_type == 'expmappos':
             return self._to_expmappos(X)
+        elif self.param_type == '6Dpos':
+            return self._to_6Dpos(X)
         else:
-            raise 'param types: euler, quat, expmap, position, expmappos'
+            raise 'param types: euler, quat, expmap, position, expmappos, 6Dpos'
     
     def inverse_transform(self, X, copy=None): 
         if self.param_type == 'euler':
@@ -69,8 +71,151 @@ class MocapParameterizer(BaseEstimator, TransformerMixin):
             return X
         elif self.param_type == 'expmappos':
             return self._expmappos_to_euler(X)
+        elif self.param_type == '6Dpos':
+            return self._6Dpos_to_euler(X)
         else:
-            raise 'param types: euler, quat, expmap, position, expmappos'
+            raise 'param types: euler, quat, expmap, position, expmappos, 6Dpos'
+
+    def _sixd_to_rotmat(self, sixd: np.ndarray, eps: float = 1e-8) -> np.ndarray:
+        """
+        sixd: (T, 6) -> rotmat: (T, 3, 3)
+        """
+        a1 = sixd[:, 0:3]
+        a2 = sixd[:, 3:6]
+
+        b1 = a1 / (np.linalg.norm(a1, axis=1, keepdims=True) + eps)
+        dot = np.sum(b1 * a2, axis=1, keepdims=True)
+        a2_ortho = a2 - dot * b1
+        b2 = a2_ortho / (np.linalg.norm(a2_ortho, axis=1, keepdims=True) + eps)
+        b3 = np.cross(b1, b2)
+
+        Rm = np.stack([b1, b2, b3], axis=-1)  # (T,3,3) columns
+        return Rm
+
+    def _rotmat_to_sixd(self, Rm: np.ndarray) -> np.ndarray:
+        """
+        Rm: (T, 3, 3) -> sixd: (T, 6) using first two columns
+        """
+        c1 = Rm[:, :, 0]
+        c2 = Rm[:, :, 1]
+        return np.concatenate([c1, c2], axis=1)  # (T,6)
+
+    def _euler_df_to_6d_df(self, track) -> pd.DataFrame:
+        euler_df = track.values
+
+        # Keep non-rotation columns
+        out_df = euler_df.copy()
+        rot_cols = [c for c in euler_df.columns if ('rotation' in c and 'Nub' not in c)]
+
+        sixd_cols = {}  # collect here
+        joints = (j for j in track.skeleton if 'Nub' not in j)
+
+        for joint in joints:
+            rot_order = track.skeleton[joint]['order']
+            rc = euler_df[[c for c in rot_cols if joint in c]]
+
+            if rc.shape[1] < 3:
+                eulers = np.zeros((len(euler_df), 3), dtype=np.float64)
+                rot_order_eff = "XYZ"
+            else:
+                r1 = f"{joint}_{rot_order[0]}rotation"
+                r2 = f"{joint}_{rot_order[1]}rotation"
+                r3 = f"{joint}_{rot_order[2]}rotation"
+                eulers = np.stack([
+                    euler_df[r1].to_numpy(),
+                    euler_df[r2].to_numpy(),
+                    euler_df[r3].to_numpy()
+                ], axis=1)
+                rot_order_eff = rot_order
+
+                # remove Euler columns once
+                out_df.drop([r1, r2, r3], axis=1, inplace=True)
+
+            Rm = R.from_euler(rot_order_eff, eulers, degrees=True).as_matrix()
+            sixd = self._rotmat_to_sixd(Rm)
+
+            for k in range(6):
+                sixd_cols[f"{joint}_6d{k}rotation"] = sixd[:, k]
+
+        # concat ONCE → no fragmentation
+        sixd_df = pd.DataFrame(sixd_cols, index=out_df.index)
+        out_df = pd.concat([out_df, sixd_df], axis=1)
+
+        return out_df.copy()  # fully defragmented
+
+
+    def _sixd_df_to_euler_df(self, track) -> pd.DataFrame:
+        sixd_df = track.values
+        out_df = sixd_df.copy()
+
+        joints = (j for j in track.skeleton if 'Nub' not in j)
+
+        for joint in joints:
+            rot_order = track.skeleton[joint]['order']
+
+            cols6 = [f"{joint}_6d{k}rotation" for k in range(6)]
+            have_all = all(c in sixd_df.columns for c in cols6)
+
+            if not have_all:
+                # if missing, skip (or create zeros)
+                continue
+
+            sixd = sixd_df[cols6].to_numpy()  # (T,6)
+            out_df.drop(cols6, axis=1, inplace=True)
+
+            Rm = self._sixd_to_rotmat(sixd)  # (T,3,3)
+            eulers = R.from_matrix(Rm).as_euler(rot_order, degrees=True)  # (T,3)
+
+            out_df[f"{joint}_{rot_order[0]}rotation"] = eulers[:, 0]
+            out_df[f"{joint}_{rot_order[1]}rotation"] = eulers[:, 1]
+            out_df[f"{joint}_{rot_order[2]}rotation"] = eulers[:, 2]
+
+        return out_df
+
+
+    def _to_6Dpos(self, X):
+        """
+        Returns tracks where values contain BOTH:
+        - 6D rotation parameters (as {joint}_6d0rotation..{joint}_6d5rotation)
+        - forward-kinematics joint positions (prefixed with 'fk_')
+        """
+        Q_pos = self._to_pos(X)
+
+        Q = []
+        for track, track_pos in zip(X, Q_pos):
+            new_track = track.clone()
+
+            # Euler -> 6D
+            sixd_df = self._euler_df_to_6d_df(track)
+
+            # FK positions with prefix
+            fk_pos_df = track_pos.values.copy().add_prefix("fk_")
+
+            new_track.values = pd.concat([sixd_df, fk_pos_df], axis=1)
+            Q.append(new_track)
+
+        return Q
+
+    def _6Dpos_to_euler(self, X):
+        """
+        Inverse for param_type='6Dpos':
+        - Remove FK position columns (starting with 'fk_')
+        - Convert remaining 6D columns back to Euler angles.
+        """
+        Q = []
+        for track in X:
+            t = track.clone()
+
+            cols_fk = [c for c in t.values.columns if c.startswith("fk_")]
+            if cols_fk:
+                t.values = t.values.drop(columns=cols_fk)
+
+            # 6D -> Euler
+            t.values = self._sixd_df_to_euler_df(t)
+
+            Q.append(t)
+
+        return Q
 
     def _to_quat(self, X):
         '''Converts joints rotations in quaternions'''
