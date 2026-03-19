@@ -22,7 +22,7 @@ from pymo.Pivots import Pivots
 class MocapParameterizer(BaseEstimator, TransformerMixin):
     def __init__(self, param_type = 'euler', ref_pose=None):
         '''
-        param_type = {'euler', 'quat', 'expmap', 'position', 'expmappos', '6Dpos'}
+        param_type = {'euler', 'quat', 'expmap', 'position', 'expmappos', '6Dpos', '6D'}
         '''
         self.param_type = param_type
         if (ref_pose is not None):
@@ -51,8 +51,10 @@ class MocapParameterizer(BaseEstimator, TransformerMixin):
             return self._to_expmappos(X)
         elif self.param_type == '6Dpos':
             return self._to_6Dpos(X)
+        elif self.param_type == '6D':
+            return self._to_6D(X)
         else:
-            raise 'param types: euler, quat, expmap, position, expmappos, 6Dpos'
+            raise 'param types: euler, quat, expmap, position, expmappos, 6Dpos, 6D'
     
     def inverse_transform(self, X, copy=None): 
         if self.param_type == 'euler':
@@ -73,8 +75,10 @@ class MocapParameterizer(BaseEstimator, TransformerMixin):
             return self._expmappos_to_euler(X)
         elif self.param_type == '6Dpos':
             return self._6Dpos_to_euler(X)
+        elif self.param_type == '6D':
+            return self._6D_to_euler(X)
         else:
-            raise 'param types: euler, quat, expmap, position, expmappos, 6Dpos'
+            raise 'param types: euler, quat, expmap, position, expmappos, 6Dpos, 6D'
 
     def _sixd_to_rotmat(self, sixd: np.ndarray, eps: float = 1e-8) -> np.ndarray:
         """
@@ -171,6 +175,56 @@ class MocapParameterizer(BaseEstimator, TransformerMixin):
             out_df[f"{joint}_{rot_order[2]}rotation"] = eulers[:, 2]
 
         return out_df
+
+
+    def _to_6D(self, X):
+        """
+        Returns tracks where values contain ONLY:
+        - 6D rotation parameters
+        ({joint}_6d0rotation .. {joint}_6d5rotation)
+
+        No FK positions.
+        """
+
+        Q = []
+
+        for track in X:
+            new_track = track.clone()
+
+            # Convert Euler -> 6D
+            sixd_df = self._euler_df_to_6d_df(track)
+
+            # Keep ONLY 6D rotations
+            new_track.values = sixd_df
+
+            Q.append(new_track)
+
+        return Q
+
+    def _6D_to_euler(self, X):
+        """
+        Inverse for param_type='6D':
+
+        Converts 6D rotation representation
+        ({joint}_6d0rotation .. {joint}_6d5rotation)
+        back to Euler angles.
+
+        No FK columns are expected.
+        """
+
+        Q = []
+
+        for track in X:
+            new_track = track.clone()
+
+            # Convert 6D -> Euler
+            euler_df = self._sixd_df_to_euler_df(track)
+
+            new_track.values = euler_df
+            Q.append(new_track)
+
+        return Q
+
 
 
     def _to_6Dpos(self, X):
