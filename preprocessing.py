@@ -22,7 +22,7 @@ from pymo.Pivots import Pivots
 class MocapParameterizer(BaseEstimator, TransformerMixin):
     def __init__(self, param_type = 'euler', ref_pose=None):
         '''
-        param_type = {'euler', 'quat', 'expmap', 'position', 'expmappos', '6Dpos', '6D'}
+        param_type = {'euler', 'quat', 'expmap', 'position', 'expmappos', '6Dpos', '6D', '6Dvel'}
         '''
         self.param_type = param_type
         if (ref_pose is not None):
@@ -53,9 +53,11 @@ class MocapParameterizer(BaseEstimator, TransformerMixin):
             return self._to_6Dpos(X)
         elif self.param_type == '6D':
             return self._to_6D(X)
+        elif self.param_type == '6Dvel':
+            return self._to_6Dvel(X)
         else:
-            raise 'param types: euler, quat, expmap, position, expmappos, 6Dpos, 6D'
-    
+            raise 'param types: euler, quat, expmap, position, expmappos, 6Dpos, 6D, 6Dvel'
+
     def inverse_transform(self, X, copy=None): 
         if self.param_type == 'euler':
             return X
@@ -72,13 +74,15 @@ class MocapParameterizer(BaseEstimator, TransformerMixin):
             print('positions 2 eulers is not supported')
             return X
         elif self.param_type == 'expmappos':
-            return self._expmappos_to_euler(X)
+            return self._expmappos_to_euler(X)  
         elif self.param_type == '6Dpos':
             return self._6Dpos_to_euler(X)
         elif self.param_type == '6D':
             return self._6D_to_euler(X)
+        elif self.param_type == '6Dvel':
+            return self._6Dvel_to_euler(X)
         else:
-            raise 'param types: euler, quat, expmap, position, expmappos, 6Dpos, 6D'
+            raise 'param types: euler, quat, expmap, position, expmappos, 6Dpos, 6D, 6Dvel'
 
     def _sixd_to_rotmat(self, sixd: np.ndarray, eps: float = 1e-8) -> np.ndarray:
         """
@@ -347,6 +351,26 @@ class MocapParameterizer(BaseEstimator, TransformerMixin):
 
         return Q
 
+    def _6Dvel_to_euler(self, X):
+        """
+        Inverse for param_type='6Dvel':
+        - Remove velocity columns (starting with 'vel_')
+        - Convert remaining 6D rotation columns back to Euler angles
+        """
+        Q = []
+
+        for track in X:
+            t = track.clone()
+
+            cols_vel = [c for c in t.values.columns if c.startswith("vel_")]
+            if len(cols_vel) > 0:
+                t.values = t.values.drop(columns=cols_vel)
+
+            t.values = self._sixd_df_to_euler_df(t)
+            Q.append(t)
+
+        return Q
+
     def _to_quat(self, X):
         '''Converts joints rotations in quaternions'''
 
@@ -515,6 +539,30 @@ class MocapParameterizer(BaseEstimator, TransformerMixin):
             new_track = track.clone()
             new_track.values = pos_df
             Q.append(new_track)
+        return Q
+
+    def _to_6Dvel(self, X):
+        """
+        Returns tracks where values contain BOTH:
+        - 6D rotation parameters (replacing Euler rotation columns)
+        - global joint velocities (prefixed with 'vel_')
+        """
+        Q_6d = self._to_6D(X)
+        Q_pos = self._to_pos(X)
+
+        Q = []
+        for track_6d, track_pos in zip(Q_6d, Q_pos):
+            new_track = track_6d.clone()
+
+            pos_df = track_pos.values.copy()
+
+            # Finite difference global positions -> global velocities
+            vel_df = pos_df.diff().fillna(0.0)
+            vel_df = vel_df.add_prefix("vel_")
+
+            new_track.values = pd.concat([track_6d.values, vel_df], axis=1)
+            Q.append(new_track)
+
         return Q
 
     def _expmap2rot(self, expmap):
@@ -2835,21 +2883,26 @@ class PositionDropper(BaseEstimator, TransformerMixin):
       - fit(): decide once which *_Xposition/_Yposition/_Zposition to drop
       - transform(): drop them & cache originals per track
       - inverse_transform(): restore from cache in one batch
-    Crucially: keeps root XYZ so upstream inverse steps (e.g., RootTransformer) never KeyError.
 
-    New option:
-      - keep_fk_positions: if True, columns starting with "fk_" are never dropped.
+    Crucially: keeps root XYZ so upstream inverse steps
+    (e.g., RootTransformer) never KeyError.
+
+    Options:
+      - keep_fk_positions: if True, columns starting with "fk_" are never dropped
+      - keep_velocities: if True, columns starting with "vel_" are never dropped
     """
 
     def __init__(self,
                  keep_root_xyz: bool = True,
                  keep_names: list = None,
                  root_candidates: list = None,
-                 keep_fk_positions: bool = True):
+                 keep_fk_positions: bool = True,
+                 keep_velocities: bool = True):
         self.keep_root_xyz = keep_root_xyz
         self.keep_names = list(keep_names) if keep_names else []
         self.root_candidates = root_candidates or ["Hips", "Root", "Pelvis", "root", "pelvis"]
         self.keep_fk_positions = keep_fk_positions
+        self.keep_velocities = keep_velocities
 
         # learned in fit()
         self.drop_cols_ = []
@@ -2865,31 +2918,57 @@ class PositionDropper(BaseEstimator, TransformerMixin):
     def _get_df(self, obj):
         """Return (df, setter, is_track_obj)."""
         if hasattr(obj, "values") and isinstance(obj.values, pd.DataFrame):
-            def setter(new_df): obj.values = new_df
+            def setter(new_df):
+                obj.values = new_df
             return obj.values, setter, True
         elif isinstance(obj, pd.DataFrame):
-            def setter(new_df): pass  # caller will return df
+            def setter(new_df):
+                pass
             return obj, setter, False
         else:
             raise TypeError("Expected track.values (DataFrame) or a pandas DataFrame.")
 
     def _position_columns(self, cols):
-        """Return position columns that are *eligible* for dropping."""
+        """
+        Return position-like columns that are eligible for dropping.
+
+        By default this includes anything ending with:
+            _Xposition, _Yposition, _Zposition
+
+        But optionally preserves:
+            fk_*   (FK positions)
+            vel_*  (velocity features stored with position-like suffixes)
+        """
         base = [c for c in cols if c.endswith(self._pos_suffixes)]
+
         if self.keep_fk_positions:
-            # Never drop FK positions like fk_Hips_Xposition
             base = [c for c in base if not c.startswith("fk_")]
+
+        if self.keep_velocities:
+            base = [c for c in base if not c.startswith("vel_")]
+
         return base
 
     def _build_keep_set(self, cols):
-        keep = set(self.keep_names)
+        keep = set()
+
+        # Keep exact column names if passed
+        for name in self.keep_names:
+            if name in cols:
+                keep.add(name)
+
+        # Also allow prefix behavior, e.g. keep_names=['fk_', 'vel_']
+        for name in self.keep_names:
+            if isinstance(name, str) and name.endswith("_"):
+                keep.update([c for c in cols if c.startswith(name)])
+
         if self.keep_root_xyz:
-            # Keep ANY root candidate XYZ that exists in this schema
             for r in self.root_candidates:
                 for ax in ("X", "Y", "Z"):
                     c = f"{r}_{ax}position"
                     if c in cols:
                         keep.add(c)
+
         return keep
 
     # ---------- sklearn API ----------
@@ -2897,6 +2976,7 @@ class PositionDropper(BaseEstimator, TransformerMixin):
     def fit(self, X, y=None):
         if not X:
             raise ValueError("PositionDropper.fit() received empty X.")
+
         df0, _, _ = self._get_df(X[0])
         cols0 = list(df0.columns)
         self.schema_ = cols0
@@ -2904,10 +2984,6 @@ class PositionDropper(BaseEstimator, TransformerMixin):
         keep = self._build_keep_set(cols0)
         pos_cols = self._position_columns(cols0)
         self.drop_cols_ = [c for c in pos_cols if c not in keep]
-
-        # Debug (optional):
-        # print("[PositionDropper] Keeping:", sorted(keep))
-        # print("[PositionDropper] Dropping:", sorted(self.drop_cols_))
 
         return self
 
@@ -2932,18 +3008,19 @@ class PositionDropper(BaseEstimator, TransformerMixin):
                 out.append(obj)
             else:
                 out.append(new_df)
+
         return out
 
     def inverse_transform(self, X, copy=None):
         if self._cache_per_track_ is None:
-            return X  # no-op if nothing was dropped
+            return X
 
         def _restore(df, cache_df):
             if cache_df is None or cache_df.empty:
                 return df
 
             T = len(df.index)
-            # align lengths for all cached columns
+
             aligned = {}
             for col in cache_df.columns:
                 s = cache_df[col]
@@ -2954,36 +3031,38 @@ class PositionDropper(BaseEstimator, TransformerMixin):
                     aligned[col] = s.iloc[:T].values
                 else:
                     pad_val = s.iloc[-1] if n > 0 else 0.0
-                    aligned[col] = np.concatenate([s.values, np.full(T - n, pad_val, dtype=float)], axis=0)
+                    aligned[col] = np.concatenate(
+                        [s.values, np.full(T - n, pad_val, dtype=float)],
+                        axis=0
+                    )
 
             add_df = pd.DataFrame(aligned, index=df.index)
 
-            # Overlaps: single vectorized write
             overlap = [c for c in add_df.columns if c in df.columns]
             if overlap:
                 df.loc[:, overlap] = add_df[overlap].to_numpy()
                 add_df = add_df.drop(columns=overlap)
 
-            # New columns: single concat
             if not add_df.empty:
                 df = pd.concat([df, add_df], axis=1)
 
-            # Reorder to original schema if known
             if self.schema_:
                 ordered = [c for c in self.schema_ if c in df.columns]
                 extras = [c for c in df.columns if c not in ordered]
                 df = df[ordered + extras]
 
-            return df.copy()  # defragment
+            return df.copy()
 
         out = []
         for i, obj in enumerate(X):
             df, setter, is_track = self._get_df(obj)
             cache_df = self._cache_per_track_[i] if i < len(self._cache_per_track_) else None
             new_df = _restore(df, cache_df)
+
             if is_track:
                 setter(new_df)
                 out.append(obj)
             else:
                 out.append(new_df)
+
         return out
