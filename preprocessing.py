@@ -487,11 +487,17 @@ class MocapParameterizer(BaseEstimator, TransformerMixin):
                 rot_order = track.skeleton[joint]['order']
                 #print("rot_order:" + joint + " :" + rot_order)
 
-                # Get the rotation columns that belong to this joint
-                rc = euler_df[[c for c in rot_cols if joint in c]]
+                # Get the rotation columns that belong to this joint.
+                # Match the prefix exactly: a substring test makes
+                # "RightHand" pick up "RightHandThumb1_Xposition", so a
+                # joint whose own channels are absent looks present and
+                # the exact-name lookup below then raises KeyError.
+                rc = euler_df[[c for c in rot_cols
+                               if c.startswith(joint + '_')]]
 
                 # Get the position columns that belong to this joint
-                pc = euler_df[[c for c in pos_cols if joint in c]]
+                pc = euler_df[[c for c in pos_cols
+                               if c.startswith(joint + '_')]]
 
                 # Make sure the columns are organized in xyz order
                 if rc.shape[1] < 3:
@@ -521,8 +527,19 @@ class MocapParameterizer(BaseEstimator, TransformerMixin):
                     # for every frame i, multiply this joint's rotmat to the rotmat of its parent
                     tree_data[joint][0] = tree_data[parent][0]*quats# np.matmul(rotmats, tree_data[parent][0])
 
-                    # add the position channel to the offset and store it in k, for every frame i
-                    k = pos_values + np.asarray(track.skeleton[joint]['offsets'])
+                    # Bone vector in the parent's frame. When the BVH gives
+                    # this joint explicit position channels they already
+                    # carry its translation -- in the Motorica-retargeted
+                    # skeletons used here they are constant over time and
+                    # equal to the OFFSET, so adding the OFFSET on top
+                    # doubles every bone length. Fall back to the OFFSET
+                    # only when there are no position channels, in which
+                    # case pos_values is the zero array built above.
+                    if pc.shape[1] < 3:
+                        k = pos_values + np.asarray(
+                            track.skeleton[joint]['offsets'])
+                    else:
+                        k = pos_values
 
                     # multiply k to the rotmat of the parent for every frame i
                     q = tree_data[parent][0]*k #np.matmul(k.reshape(k.shape[0],1,3), tree_data[parent][0])
@@ -1397,8 +1414,17 @@ class Numpyfier(BaseEstimator, TransformerMixin):
 
         if self.indices is not None:
             if all(isinstance(i, str) for i in self.indices):
-                self.selected_columns_ = [col for col in self.indices if col in all_columns]
-                self.selected_indices_ = [all_columns.index(col) for col in self.selected_columns_]
+                # Fail loud. Silently dropping a requested name shifts every
+                # later feature by one column, which downstream code cannot
+                # detect and which no caller can recover from.
+                missing = [c for c in self.indices if c not in all_columns]
+                if missing:
+                    raise ValueError(
+                        "Numpyfier: requested columns are absent from the "
+                        "pipeline output: %s" % missing)
+                self.selected_columns_ = list(self.indices)
+                self.selected_indices_ = [all_columns.index(c)
+                                          for c in self.selected_columns_]
             elif all(isinstance(i, int) for i in self.indices):
                 self.selected_indices_ = [i for i in self.indices if i < len(all_columns)]
                 self.selected_columns_ = [all_columns[i] for i in self.selected_indices_]
@@ -1419,13 +1445,11 @@ class Numpyfier(BaseEstimator, TransformerMixin):
         if not X:
             raise ValueError("Numpyfier received an empty dataset during transform!")
 
-        Q = []
-        for i, track in enumerate(X):
-            try:
-                filtered = track.values.iloc[:, self.selected_indices_].to_numpy()
-                Q.append(filtered)
-            except Exception as e:
-                print(f"⚠️ Error processing track {i}: {e}")
+        # Index by label, not position: positional indexing is silent if the
+        # transform-time schema differs from the fit-time one. Errors are not
+        # caught -- swallowing one track used to shift the remaining tracks
+        # down, so the mirrored clip was written under the original's name.
+        Q = [track.values[self.selected_columns_].to_numpy() for track in X]
 
         max_rows = max(a.shape[0] for a in Q)
         max_cols = max(a.shape[1] for a in Q)
@@ -2881,8 +2905,17 @@ class PositionDropper(BaseEstimator, TransformerMixin):
     """
     ConstantsRemover-style position dropper:
       - fit(): decide once which *_Xposition/_Yposition/_Zposition to drop
-      - transform(): drop them & cache originals per track
-      - inverse_transform(): restore from cache in one batch
+      - transform(): drop them
+      - inverse_transform(): no-op
+
+    Dropping is lossless. The dropped channels are non-root joints' BVH
+    position channels, which are constant over time and equal to the
+    joint's OFFSET. BVHWriter never writes them (writers.py, _printJoint)
+    and MocapParameterizer._to_pos falls back to the OFFSET when they are
+    absent, so nothing downstream needs them restored. They used to be
+    cached per track, but that cache was instance state and so was pickled
+    into the fitted pipeline: it held only the tracks seen at fit time, so
+    generating more clips than that left the extra clips unrestored.
 
     Crucially: keeps root XYZ so upstream inverse steps
     (e.g., RootTransformer) never KeyError.
@@ -2907,9 +2940,6 @@ class PositionDropper(BaseEstimator, TransformerMixin):
         # learned in fit()
         self.drop_cols_ = []
         self.schema_ = None
-
-        # filled in transform()
-        self._cache_per_track_ = None  # list[pd.DataFrame] of dropped columns per track
 
         self._pos_suffixes = ("_Xposition", "_Yposition", "_Zposition")
 
@@ -2991,15 +3021,12 @@ class PositionDropper(BaseEstimator, TransformerMixin):
         if not X:
             raise ValueError("PositionDropper.transform() received empty X.")
 
-        self._cache_per_track_ = []
         out = []
 
         for obj in X:
             df, setter, is_track = self._get_df(obj)
 
             present_to_drop = [c for c in self.drop_cols_ if c in df.columns]
-            cache_df = df[present_to_drop].copy() if present_to_drop else pd.DataFrame(index=df.index)
-            self._cache_per_track_.append(cache_df)
 
             new_df = df.drop(columns=present_to_drop, errors="ignore") if present_to_drop else df.copy()
 
@@ -3012,57 +3039,25 @@ class PositionDropper(BaseEstimator, TransformerMixin):
         return out
 
     def inverse_transform(self, X, copy=None):
-        if self._cache_per_track_ is None:
-            return X
+        """
+        No-op: the dropped columns are recoverable from the skeleton.
 
-        def _restore(df, cache_df):
-            if cache_df is None or cache_df.empty:
-                return df
+        The dropped channels are non-root joints' BVH position channels,
+        which are constant over time and equal to the joint's OFFSET.
+        BVHWriter never writes them and MocapParameterizer._to_pos falls
+        back to the OFFSET when they are absent, so nothing downstream
+        needs them restored.
 
-            T = len(df.index)
+        Parameters
+        ----------
+        X : list
+            Tracks or DataFrames from the downstream inverse step.
+        copy : object, optional
+            Unused; kept for the sklearn transformer signature.
 
-            aligned = {}
-            for col in cache_df.columns:
-                s = cache_df[col]
-                n = len(s)
-                if n == T:
-                    aligned[col] = s.values
-                elif n > T:
-                    aligned[col] = s.iloc[:T].values
-                else:
-                    pad_val = s.iloc[-1] if n > 0 else 0.0
-                    aligned[col] = np.concatenate(
-                        [s.values, np.full(T - n, pad_val, dtype=float)],
-                        axis=0
-                    )
-
-            add_df = pd.DataFrame(aligned, index=df.index)
-
-            overlap = [c for c in add_df.columns if c in df.columns]
-            if overlap:
-                df.loc[:, overlap] = add_df[overlap].to_numpy()
-                add_df = add_df.drop(columns=overlap)
-
-            if not add_df.empty:
-                df = pd.concat([df, add_df], axis=1)
-
-            if self.schema_:
-                ordered = [c for c in self.schema_ if c in df.columns]
-                extras = [c for c in df.columns if c not in ordered]
-                df = df[ordered + extras]
-
-            return df.copy()
-
-        out = []
-        for i, obj in enumerate(X):
-            df, setter, is_track = self._get_df(obj)
-            cache_df = self._cache_per_track_[i] if i < len(self._cache_per_track_) else None
-            new_df = _restore(df, cache_df)
-
-            if is_track:
-                setter(new_df)
-                out.append(obj)
-            else:
-                out.append(new_df)
-
-        return out
+        Returns
+        -------
+        list
+            ``X``, unchanged.
+        """
+        return X

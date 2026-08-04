@@ -124,9 +124,39 @@ def sketch_move(mocap_track, data=None, ax=None, figsize=(16,8)):
                 
                 ax.plot([parent_x, child_x], [parent_y, child_y], '-', lw=1, color='gray', alpha=frame_alpha)
 
-def render_mp4(mocap_track, filename, data=None, ax=None, axis_scale=50, elev=45, azim=45):
+def render_mp4(mocap_track, filename, data=None, ax=None, axis_scale=50, elev=45, azim=45,
+               dpi=50, figsize=(10,10), ground_res=11, outline=True,
+               extra_args=('-preset', 'ultrafast', '-crf', '23', '-pix_fmt', 'yuv420p')):
+    """Render a skeleton animation to an mp4.
+
+    Parameters
+    ----------
+    mocap_track : MocapData
+        Track holding joint positions (run MocapParameterizer('position') first).
+    filename : str or None
+        Output mp4 path. Nothing is written when None.
+    data : pandas.DataFrame, optional
+        Position values to draw. Defaults to mocap_track.values.
+    ax : matplotlib 3d axes, optional
+        Draw into an existing axes instead of building a new figure.
+    axis_scale : float
+        Half-extent of the plotted volume.
+    elev, azim : float
+        Camera elevation and azimuth.
+    dpi : int
+        Output dots-per-inch. With figsize=(10,10) the default gives 500x500.
+    figsize : tuple of float
+        Figure size in inches.
+    ground_res : int
+        Number of grid lines per side of the ground plane. It is re-projected
+        on every frame, so a dense grid is expensive.
+    outline : bool
+        Draw a black stroke around each limb. Costs ~20% of the render time.
+    extra_args : sequence of str
+        Passed to ffmpeg. The default trades file size for encoding speed.
+    """
     if ax is None:
-        fig = plt.figure(figsize=(10,10))
+        fig = plt.figure(figsize=figsize)
         ax = fig.add_subplot(111, projection='3d')
         ax.set_xlim3d(-axis_scale, axis_scale)
         ax.set_zlim3d( 0, axis_scale)
@@ -136,66 +166,54 @@ def render_mp4(mocap_track, filename, data=None, ax=None, axis_scale=50, elev=45
 
         ax.view_init(elev=elev, azim=azim)
 
-        xs = np.linspace(-200, 200, 50)
-        ys = np.linspace(-200, 200, 50)
+        xs = np.linspace(-200, 200, ground_res)
+        ys = np.linspace(-200, 200, ground_res)
         X, Y = np.meshgrid(xs, ys)
         Z = np.zeros(X.shape)
-        
-        wframe = ax.plot_wireframe(X, Y, Z, rstride=2, cstride=2, color='grey',lw=0.2)
 
-        # fig = plt.figure(figsize=figsize)
-        # ax = fig.add_subplot(111)
-    
+        wframe = ax.plot_wireframe(X, Y, Z, rstride=1, cstride=1, color='grey',lw=0.2)
+    else:
+        fig = ax.get_figure()
+
     if data is None:
         data = mocap_track.values
-        
-    fps=int(np.round(1/mocap_track.framerate))
-    lines=[]
-    lines.append([plt.plot([0,0], [0,0], [0,0], color='red', 
-        lw=2, path_effects=[pe.Stroke(linewidth=3, foreground='black'), pe.Normal()])[0] for _ in range(len(mocap_track.skeleton.keys()))])
-        
-    def animate(frame):
-                
-        changed = []
-        j=0
-        for joint in mocap_track.skeleton.keys():
-            children_to_draw = [c for c in mocap_track.skeleton[joint]['children']]
-            
-            parent_x = data['%s_Xposition'%joint][frame]
-            parent_y = data['%s_Yposition'%joint][frame]
-            parent_z = data['%s_Zposition'%joint][frame]
-            
-            #frame_alpha = frame/data.shape[0]
-            
-            for c in children_to_draw:
-                child_x = data['%s_Xposition'%c][frame]
-                child_y = data['%s_Yposition'%c][frame]
-                child_z = data['%s_Zposition'%c][frame]
-                
-                lines[0][j].set_data(np.array([[child_x, parent_x],[-child_z,-parent_z]]))
-                lines[0][j].set_3d_properties(np.array([ child_y,parent_y]))
 
-            changed += lines
-            j+=1
-            
-        return changed
-        
+    fps=int(np.round(1/mocap_track.framerate))
+    joints = list(mocap_track.skeleton.keys())
+    effects = [pe.Stroke(linewidth=3, foreground='black'), pe.Normal()] if outline else None
+    lines = [ax.plot([0,0], [0,0], [0,0], color='red',
+        lw=2, path_effects=effects)[0] for _ in joints]
+
+    # Pull the joint positions into one dense array up front. Indexing the
+    # DataFrame per joint per frame inside animate() dominated the render.
+    xyz = np.empty((data.shape[0], len(joints), 3))
+    for j, joint in enumerate(joints):
+        xyz[:, j, 0] = data['%s_Xposition'%joint].to_numpy()
+        xyz[:, j, 1] = data['%s_Yposition'%joint].to_numpy()
+        xyz[:, j, 2] = data['%s_Zposition'%joint].to_numpy()
+    children = [[joints.index(c) for c in mocap_track.skeleton[joint]['children']]
+                for joint in joints]
+
+    def animate(frame):
+        pts = xyz[frame]
+        for j, children_to_draw in enumerate(children):
+            for c in children_to_draw:
+                lines[j].set_data(np.array([[pts[c,0], pts[j,0]],[-pts[c,2],-pts[j,2]]]))
+                lines[j].set_3d_properties(np.array([pts[c,1], pts[j,1]]))
+
     plt.tight_layout()
-        
-    ani = animation.FuncAnimation(fig, 
-        animate, np.arange(data.shape[0]), interval=1000/fps)
 
     if filename != None:
-        ani.save(filename, fps=fps, bitrate=13934)
-        ani.event_source.stop()
-        del ani
-        plt.close()    
-    try:
-        plt.show()
-        plt.save()
-    except AttributeError as e:
-        pass
-    
+        # Drive the writer directly. FuncAnimation redraws the canvas once for
+        # the animation and again when saving each frame, doubling the work.
+        writer = animation.FFMpegWriter(fps=fps, codec='h264',
+                                        extra_args=list(extra_args))
+        with writer.saving(fig, filename, dpi):
+            for frame in range(data.shape[0]):
+                animate(frame)
+                writer.grab_frame()
+        plt.close(fig)
+
 
 def viz_cnn_filter(feature_to_viz, mocap_track, data, gap=25):
     fig = plt.figure(figsize=(16,4))
